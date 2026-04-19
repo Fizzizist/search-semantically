@@ -34,6 +34,7 @@ mod ts_chunker;
 mod vector_store;
 
 pub use db::StoredChunk;
+pub use embedder::DownloadCallback;
 pub use engine::SearchEngine;
 pub use format::{SearchResult, format_results};
 pub use query_classifier::QueryType;
