@@ -1,8 +1,9 @@
 [package]
 name = "search-semantically"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "Embeddable semantic code search with multi-signal POEM ranking"
+repository = "https://github.com/Fizzizist/search-semantically"
 license = "MIT"
 keywords = ["search", "semantic", "code-search", "embedding", "poem"]
 categories = ["development-tools", "text-processing"]
