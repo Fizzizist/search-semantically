@@ -60,17 +60,22 @@ On first run, the ONNX model (`all-MiniLM-L6-v2`, 384-dim) is downloaded and cac
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────┐
-│                   SearchEngine                       │
-│                  (top-level API)                      │
-├──────────┬──────────┬──────────┬───────────┬────────┤
-│ scanner  │ chunker  │ embedder │  metrics  │ ranker │
-│  (walk)  │ (ts/txt) │  (ONNX)  │ (6 signals)│ (POEM) │
-├──────────┴──────────┴──────────┴───────────┴────────┤
-│                     db (SQLite)                      │
-│         files · chunks · symbols · imports           │
-└─────────────────────────────────────────────────────┘
+```mermaid
+graph TD
+    subgraph SearchEngine ["SearchEngine (top-level API)"]
+        scanner["scanner (walk)"]
+        chunker["chunker (ts/txt)"]
+        embedder["embedder (ONNX)"]
+        metrics["metrics (6 signals)"]
+        ranker["ranker (POEM)"]
+    end
+    db["db (SQLite)<br/>files · chunks · symbols · imports"]
+    scanner --> chunker --> embedder --> metrics --> ranker
+    scanner --- db
+    chunker --- db
+    embedder --- db
+    metrics --- db
+    ranker --- db
 ```
 
 ### Data Flow
