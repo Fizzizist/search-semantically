@@ -6,8 +6,8 @@ Embeddable semantic code search with multi-signal POEM ranking.
 
 A Rust library crate that provides local, incremental code search combining BM25 full-text search, vector similarity via ONNX embeddings, path matching, symbol matching, import graph propagation, and git recency — ranked using **Pareto-optimal Election Method (POEM)**.
 
-[!NOTE]
-I (@Fizzizist) cannot take credit for the data science that went into this crate. All credit goes to the hard work done by @aebrer and colleagues.
+> [!NOTE]
+> I (@Fizzizist) cannot take credit for the data science that went into this crate. All credit goes to the hard work done by @aebrer and colleagues.
 
 ## Features
 
