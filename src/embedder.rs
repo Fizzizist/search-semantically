@@ -165,25 +165,31 @@ fn mean_pool_normalize(data: &[f32], seq_len: usize, dim: usize, mask: &[f32]) -
 }
 
 fn download_model(model_name: &str, target_dir: &Path) -> Result<()> {
-    let base_url = format!("https://huggingface.co/{model_name}/resolve/main");
-
     let files = ["model.onnx", "tokenizer.json"];
 
-    for file in &files {
-        let url = format!("{base_url}/{file}");
-        let dest = target_dir.join(file);
+    let model_name_owned = model_name.to_string();
+    let target_dir_owned = target_dir.to_path_buf();
 
-        eprintln!("Downloading {url}...");
+    let handle = std::thread::spawn(move || -> Result<()> {
+        for file in &files {
+            let url = format!("https://huggingface.co/{model_name_owned}/resolve/main/{file}");
+            let dest = target_dir_owned.join(file);
 
-        let response = reqwest::blocking::get(&url)
-            .with_context(|| format!("HTTP request to {url}"))?
-            .error_for_status()
-            .context("HTTP request failed")?;
-        let buf = response.bytes().context("Reading response body")?;
-        std::fs::write(&dest, &buf).with_context(|| format!("Writing {}", dest.display()))?;
-    }
+            eprintln!("Downloading {url}...");
 
-    Ok(())
+            let response = reqwest::blocking::get(&url)
+                .with_context(|| format!("HTTP request to {url}"))?
+                .error_for_status()
+                .context("HTTP request failed")?;
+            let buf = response.bytes().context("Reading response body")?;
+            std::fs::write(&dest, &buf).with_context(|| format!("Writing {}", dest.display()))?;
+        }
+        Ok(())
+    });
+
+    handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("Model download thread panicked"))?
 }
 
 #[cfg(test)]
