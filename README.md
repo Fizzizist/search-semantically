@@ -118,7 +118,3 @@ All tests use `tempfile::TempDir` for full isolation — no setup required.
 
 - **Index database**: `<project_root>/.search-index/search.db`
 - **ONNX model cache**: `$XDG_CACHE_DIR/search-semantically/models/Xenova/all-MiniLM-L6-v2/`
-
-## License
-
-<!-- Add your license here -->
