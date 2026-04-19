@@ -572,6 +572,7 @@ fn extract_java_imports(content: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
     use std::fs;
     use tempfile::TempDir;
 
@@ -675,5 +676,28 @@ mod tests {
 
         let result2 = engine.search("second", 20, None).expect("search");
         assert!(result2.contains("b.rs"));
+    }
+
+    #[tokio::test]
+    async fn search_from_tokio_context_does_not_panic() {
+        let cache_temp = TempDir::new().expect("cache temp dir");
+        // SAFETY: This is an isolated test — mutating the env var is safe
+        // within this test's scope to force a unique cold model cache path.
+        unsafe { env::set_var("XDG_CACHE_HOME", cache_temp.path()) };
+
+        let temp = TempDir::new().expect("project temp dir");
+        fs::write(
+            temp.path().join("lib.rs"),
+            "fn search_engine() -> Vec<String> {\n    vec![\"hello\".to_string()]\n}\n",
+        )
+        .expect("write");
+
+        let engine = SearchEngine::new(temp.path().to_path_buf());
+        let result = engine.search("search_engine", 20, None);
+        assert!(
+            result.is_ok(),
+            "Search from tokio context should not panic: {:?}",
+            result.err()
+        );
     }
 }

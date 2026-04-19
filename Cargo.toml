@@ -11,6 +11,7 @@ categories = ["development-tools", "text-processing"]
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1.52.1", features = ["macros", "rt"] }
 
 [features]
 default = ["ts-rust"]
