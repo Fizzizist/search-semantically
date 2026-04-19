@@ -1,6 +1,6 @@
 # search-semantically
 
-<img src="assets/hero.png" alt="search-semantically logo" width="480" />
+![logo](./assets/hero.png)
 
 Embeddable semantic code search with multi-signal POEM ranking.
 
