@@ -399,25 +399,59 @@ fn extract_imports(content: &str, file_type: &super::scanner::FileType) -> Vec<S
 
 fn extract_rust_imports(content: &str) -> Vec<String> {
     let mut imports = Vec::new();
-    for line in content.lines() {
-        let trimmed = line.trim();
+    let lines: Vec<&str> = content.lines().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let trimmed = lines[i].trim();
         if !trimmed.starts_with("use ") {
+            i += 1;
             continue;
         }
-        let path = trimmed
+
+        let mut full_line = trimmed.to_string();
+
+        if trimmed.contains("::{") && !trimmed.contains("};") {
+            let mut found_close = false;
+            for next_line in &lines[i + 1..] {
+                full_line.push(' ');
+                full_line.push_str(next_line.trim());
+                if full_line.contains("};") {
+                    found_close = true;
+                    break;
+                }
+            }
+            if !found_close {
+                i += 1;
+                continue;
+            }
+        }
+
+        let path = full_line
             .strip_prefix("use ")
             .unwrap_or("")
             .trim()
             .trim_end_matches(';')
             .trim();
 
-        // Handle grouped imports: use foo::{bar, baz}
         if let Some(brace_start) = path.find("::{") {
             let base = &path[..brace_start];
-            let inner = &path[brace_start + 3..path.len().saturating_sub(1)];
+            let after_brace = &path[brace_start + 3..];
+            let close_pos = match after_brace.rfind('}') {
+                Some(p) => p,
+                None => {
+                    i += 1;
+                    continue;
+                }
+            };
+            let inner = after_brace[..close_pos].trim();
             let base_normalized = base.replace("::", "/");
             for item in inner.split(',') {
-                let full = format!("{}/{}", base_normalized, item.trim());
+                let item = item.trim();
+                if item.is_empty() {
+                    continue;
+                }
+                let full = format!("{}/{}", base_normalized, item);
                 let resolved = resolve_rust_path(&full);
                 imports.push(resolved);
             }
@@ -425,6 +459,8 @@ fn extract_rust_imports(content: &str) -> Vec<String> {
             let resolved = resolve_rust_path(&path.replace("::", "/"));
             imports.push(resolved);
         }
+
+        i += 1;
     }
     imports
 }
@@ -691,6 +727,50 @@ mod tests {
 
         let result2 = engine.search("second", 20, None).expect("search");
         assert!(result2.contains("b.rs"));
+    }
+
+    #[test]
+    fn extract_rust_imports_multiline_grouped() {
+        let code = "use std::collections::{\n    HashMap,\n    BTreeMap,\n};\n";
+        let imports = extract_rust_imports(code);
+        assert!(imports.contains(&"lib/std/collections/HashMap".to_string()));
+        assert!(imports.contains(&"lib/std/collections/BTreeMap".to_string()));
+    }
+
+    #[test]
+    fn extract_rust_imports_multiline_crate_path() {
+        let code = "use crate::upnp::{\n    browse,\n    browse_recursively,\n    Container,\n};\n";
+        let imports = extract_rust_imports(code);
+        assert!(imports.contains(&"upnp/browse".to_string()));
+        assert!(imports.contains(&"upnp/browse_recursively".to_string()));
+        assert!(imports.contains(&"upnp/Container".to_string()));
+    }
+
+    #[test]
+    fn extract_rust_imports_open_brace_only_no_panic() {
+        let code = "use foo::{\n";
+        let imports = extract_rust_imports(code);
+        assert!(imports.is_empty());
+    }
+
+    #[test]
+    fn extract_rust_imports_trailing_comma_multiline() {
+        let code = "use std::io::{Read, Write,};\n";
+        let imports = extract_rust_imports(code);
+        assert!(imports.contains(&"lib/std/io/Read".to_string()));
+        assert!(imports.contains(&"lib/std/io/Write".to_string()));
+        assert_eq!(imports.len(), 2);
+    }
+
+    #[test]
+    fn extract_rust_imports_mixed_single_and_multiline() {
+        let code = "use std::fs;\nuse crate::engine::{\n    SearchEngine,\n    MetricScores,\n};\nuse super::db::SearchDb;\n";
+        let imports = extract_rust_imports(code);
+        assert!(imports.contains(&"lib/std/fs".to_string()));
+        assert!(imports.contains(&"engine/SearchEngine".to_string()));
+        assert!(imports.contains(&"engine/MetricScores".to_string()));
+        assert!(imports.contains(&"db/SearchDb".to_string()));
+        assert_eq!(imports.len(), 4);
     }
 
     #[tokio::test]
