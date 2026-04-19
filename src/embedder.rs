@@ -189,7 +189,7 @@ fn download_model(model_name: &str, target_dir: &Path) -> Result<()> {
 
     handle
         .join()
-        .map_err(|_| anyhow::anyhow!("Model download thread panicked"))?
+        .map_err(|e| anyhow::anyhow!("Model download thread panicked: {e:?}"))?
 }
 
 #[cfg(test)]
