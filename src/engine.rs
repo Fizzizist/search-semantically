@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 
 use super::chunker;
 use super::db::{SearchDb, StoredChunk};
-use super::embedder::Embedder;
+use super::embedder::{DownloadCallback, Embedder};
 use super::format::{SearchResult, format_results};
 use super::metrics;
 use super::query_classifier::classify_query;
@@ -20,6 +20,7 @@ const METRIC_CANDIDATE_LIMIT: usize = 1000;
 pub struct SearchEngine {
     project_root: PathBuf,
     embedder_cache_dir: PathBuf,
+    download_callback: Option<DownloadCallback>,
 }
 
 impl SearchEngine {
@@ -31,11 +32,25 @@ impl SearchEngine {
         Self {
             project_root,
             embedder_cache_dir,
+            download_callback: None,
         }
     }
 
+    pub fn with_download_callback(mut self, callback: DownloadCallback) -> Self {
+        self.download_callback = Some(callback);
+        self
+    }
+
+    pub fn set_download_callback(&mut self, callback: DownloadCallback) {
+        self.download_callback = Some(callback);
+    }
+
     fn get_embedder(&self) -> Embedder {
-        Embedder::new(self.embedder_cache_dir.clone())
+        let mut embedder = Embedder::new(self.embedder_cache_dir.clone());
+        if let Some(ref cb) = self.download_callback {
+            embedder.set_download_callback(cb.clone());
+        }
+        embedder
     }
 
     fn ensure_embedder(embedder: &mut Embedder) -> bool {

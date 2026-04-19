@@ -2,6 +2,9 @@ use anyhow::{Context, Result};
 use ort::session::Session;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
+
+pub type DownloadCallback = Arc<dyn Fn(&str) + Send + Sync>;
 
 const DEFAULT_MODEL_NAME: &str = "Xenova/all-MiniLM-L6-v2";
 const DEFAULT_DIMENSION: usize = 384;
@@ -12,6 +15,7 @@ pub struct Embedder {
     session: Option<Session>,
     tokenizer: Option<tokenizers::Tokenizer>,
     dimension: usize,
+    download_callback: Option<DownloadCallback>,
 }
 
 impl Embedder {
@@ -22,7 +26,17 @@ impl Embedder {
             session: None,
             tokenizer: None,
             dimension: DEFAULT_DIMENSION,
+            download_callback: None,
         }
+    }
+
+    pub fn with_download_callback(mut self, callback: DownloadCallback) -> Self {
+        self.download_callback = Some(callback);
+        self
+    }
+
+    pub fn set_download_callback(&mut self, callback: DownloadCallback) {
+        self.download_callback = Some(callback);
     }
 
     pub fn initialize(&mut self) -> Result<()> {
@@ -38,7 +52,7 @@ impl Embedder {
         let tokenizer_path = model_dir.join("tokenizer.json");
 
         if !onnx_path.exists() || !tokenizer_path.exists() {
-            download_model(&self.model_name, &model_dir)?;
+            download_model(&self.model_name, &model_dir, self.download_callback.clone())?;
         }
 
         let session = Session::builder()
@@ -164,7 +178,11 @@ fn mean_pool_normalize(data: &[f32], seq_len: usize, dim: usize, mask: &[f32]) -
     pooled
 }
 
-fn download_model(model_name: &str, target_dir: &Path) -> Result<()> {
+fn download_model(
+    model_name: &str,
+    target_dir: &Path,
+    callback: Option<DownloadCallback>,
+) -> Result<()> {
     let files = ["model.onnx", "tokenizer.json"];
 
     let model_name_owned = model_name.to_string();
@@ -175,7 +193,9 @@ fn download_model(model_name: &str, target_dir: &Path) -> Result<()> {
             let url = format!("https://huggingface.co/{model_name_owned}/resolve/main/{file}");
             let dest = target_dir_owned.join(file);
 
-            eprintln!("Downloading {url}...");
+            if let Some(ref cb) = callback {
+                cb(&url);
+            }
 
             let response = reqwest::blocking::get(&url)
                 .with_context(|| format!("HTTP request to {url}"))?
