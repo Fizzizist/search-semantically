@@ -31,6 +31,7 @@ mod ranker;
 mod scanner;
 mod text_chunker;
 mod ts_chunker;
+mod util;
 mod vector_store;
 
 pub use db::StoredChunk;
