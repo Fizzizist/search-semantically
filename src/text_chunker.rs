@@ -535,11 +535,7 @@ fn extract_paragraph_name(content: &str) -> Option<String> {
     if first_line.is_empty() {
         return None;
     }
-    if first_line.len() <= 60 {
-        Some(first_line.to_string())
-    } else {
-        Some(format!("{}...", &first_line[..57]))
-    }
+    Some(crate::util::truncate_with_ellipsis(first_line, 60))
 }
 
 fn enforce_max_size(chunk: TextChunk) -> Vec<TextChunk> {
@@ -829,5 +825,18 @@ mod tests {
         let content = "[1, 2, 3]";
         let chunks = chunk_json(content, "arr.json");
         assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn extract_paragraph_name_multibyte_does_not_panic() {
+        // Regression: multi-byte char straddling the 57-byte cut in extract_paragraph_name.
+        let prefix = "a".repeat(56);
+        let content =
+            format!("{prefix}\u{2019}rest of a very long first line that exceeds sixty bytes");
+        let name = extract_paragraph_name(&content);
+        assert!(name.is_some());
+        let name = name.expect("should have name");
+        assert!(std::str::from_utf8(name.as_bytes()).is_ok());
+        assert!(name.len() <= 60);
     }
 }
