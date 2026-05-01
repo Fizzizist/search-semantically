@@ -184,5 +184,9 @@ mod tests {
         let result = make_result("test.rs", 1, 1, "file", None, &long_line);
         let output = format_results(&[result]);
         assert!(output.contains("..."));
+        for line in output.lines() {
+            let content = line.trim_start();
+            assert!(content.len() <= 120, "preview line exceeded 120 bytes");
+        }
     }
 }

@@ -52,13 +52,13 @@ mod tests {
 
     #[test]
     fn emoji_at_cut_is_valid_utf8() {
-        // Emoji are 4 bytes
-        let prefix = "b".repeat(118);
+        // U+1F600 is 4 bytes: F0 9F 98 80. Place it so target=117 lands inside.
+        // bytes 0..=115 = 'b', bytes 116..=119 = emoji. target=117 is a continuation
+        // byte; loop must walk back to 116 (boundary at start of emoji).
+        let prefix = "b".repeat(116);
         let s = format!("{prefix}\u{1F600}more text here");
         let result = truncate_with_ellipsis(&s, 120);
-        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
-        assert!(result.len() <= 120);
-        assert!(result.ends_with("..."));
+        assert_eq!(result, format!("{}...", "b".repeat(116)));
     }
 
     #[test]
@@ -67,6 +67,14 @@ mod tests {
         let result = truncate_with_ellipsis(s, 2);
         assert!(result.len() <= 2);
         assert!(std::str::from_utf8(result.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn max_bytes_le_3_with_multibyte_walks_back_to_zero() {
+        // max_bytes=2 with a 3-byte leading char: byte 2 is a continuation byte,
+        // loop walks back to 0, returning "".
+        let result = truncate_with_ellipsis("\u{2019}hello", 2);
+        assert_eq!(result, "");
     }
 
     #[test]
