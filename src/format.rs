@@ -53,11 +53,7 @@ pub fn format_results(results: &[SearchResult]) -> String {
 
         let content_lines: Vec<&str> = r.chunk.content.lines().collect();
         for line in content_lines.iter().take(3) {
-            let trimmed = if line.len() > 120 {
-                format!("{}...", &line[..117])
-            } else {
-                line.to_string()
-            };
+            let trimmed = crate::util::truncate_with_ellipsis(line, 120);
             lines.push(format!("   {trimmed}"));
         }
         if content_lines.len() > 3 {
@@ -178,5 +174,19 @@ mod tests {
         let output = format_results(&[result]);
         assert!(!output.contains("pathMatch="));
         assert!(!output.contains("importGraph="));
+    }
+
+    #[test]
+    fn long_line_with_multibyte_char_does_not_panic() {
+        // Regression test for issue 7: U+2019 (3-byte char) near byte 117.
+        let prefix = "x".repeat(115);
+        let long_line = format!("{prefix}\u{2019}some more trailing text here");
+        let result = make_result("test.rs", 1, 1, "file", None, &long_line);
+        let output = format_results(&[result]);
+        assert!(output.contains("..."));
+        for line in output.lines() {
+            let content = line.trim_start();
+            assert!(content.len() <= 120, "preview line exceeded 120 bytes");
+        }
     }
 }
