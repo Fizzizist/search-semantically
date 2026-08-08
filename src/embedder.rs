@@ -60,6 +60,8 @@ impl Embedder {
         let onnx_path = model_dir.join("model.onnx");
         let tokenizer_path = model_dir.join("tokenizer.json");
 
+        verify_onnx_runtime()?;
+
         let session = Session::builder()
             .context("Creating ONNX session builder")?
             .commit_from_file(&onnx_path)
@@ -161,6 +163,73 @@ pub(crate) fn cache_is_valid(model_dir: &Path) -> bool {
         .unwrap_or(false);
 
     model_ok && tokenizer_ok
+}
+
+fn onnx_runtime_dylib_name() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "onnxruntime.dll"
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        "libonnxruntime.so"
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        "libonnxruntime.dylib"
+    }
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    )))]
+    {
+        "libonnxruntime.so"
+    }
+}
+
+fn verify_onnx_runtime() -> Result<()> {
+    let dylib_name = onnx_runtime_dylib_name();
+
+    let path = match std::env::var("ORT_DYLIB_PATH") {
+        Ok(s) if !s.is_empty() => std::path::PathBuf::from(s),
+        _ => {
+            let relative = std::env::current_exe()
+                .context("Could not determine current executable path")?
+                .parent()
+                .context("Executable has no parent directory")?
+                .join(dylib_name);
+            if relative.exists() {
+                relative
+            } else {
+                std::path::PathBuf::from(dylib_name)
+            }
+        }
+    };
+
+    let lib = unsafe { libloading::Library::new(&path) }.map_err(|e| {
+        anyhow::anyhow!(
+            "ONNX Runtime dynamic library not found at '{}': {e}\n\
+             Install libonnxruntime or set ORT_DYLIB_PATH to its location.\n\
+             See: https://ort.pyke.io/setup/linking",
+            path.display()
+        )
+    })?;
+
+    let _symbol: libloading::Symbol<unsafe extern "C" fn() -> *const std::ffi::c_void> =
+        unsafe { lib.get(b"OrtGetApiBase") }.map_err(|_| {
+            anyhow::anyhow!(
+                "Loaded '{}' but 'OrtGetApiBase' symbol is missing — \
+                 the library may be an incompatible ONNX Runtime version",
+                path.display()
+            )
+        })?;
+
+    std::mem::forget(lib);
+
+    Ok(())
 }
 
 fn detect_dimension(session: &Session) -> usize {
@@ -378,5 +447,61 @@ mod tests {
                 file_name
             );
         }
+    }
+
+    #[test]
+    fn verify_onnx_runtime_missing_dylib_returns_error() {
+        let orig = std::env::var("ORT_DYLIB_PATH").ok();
+        // SAFETY: isolated test — temporarily clearing ORT_DYLIB_PATH to force
+        // the probe to search the default dlopen path, which has no dylib.
+        unsafe {
+            std::env::remove_var("ORT_DYLIB_PATH");
+        }
+        let result = verify_onnx_runtime();
+        if let Some(v) = orig {
+            // SAFETY: restoring the original env var after the probe.
+            unsafe {
+                std::env::set_var("ORT_DYLIB_PATH", v);
+            }
+        }
+        if std::env::var("ORT_DYLIB_PATH").is_ok() {
+            return;
+        }
+        assert!(
+            result.is_err(),
+            "verify_onnx_runtime should fail when no dylib is installed"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("ONNX Runtime") || msg.contains("ORT_DYLIB_PATH"),
+            "Error should guide user to install or set ORT_DYLIB_PATH, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn verify_onnx_runtime_bad_dylib_path_returns_error() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let fake_dylib = temp_dir.path().join("libonnxruntime.so");
+        fs::write(&fake_dylib, b"not a shared library").expect("write");
+
+        let orig = std::env::var("ORT_DYLIB_PATH").ok();
+        // SAFETY: isolated test — setting ORT_DYLIB_PATH to a file that is not
+        // a valid shared library, to exercise the probe's error path.
+        unsafe {
+            std::env::set_var("ORT_DYLIB_PATH", &fake_dylib);
+        }
+        let result = verify_onnx_runtime();
+        if let Some(v) = orig {
+            // SAFETY: restoring the original env var.
+            unsafe {
+                std::env::set_var("ORT_DYLIB_PATH", v);
+            }
+        } else {
+            // SAFETY: removing the env var we just set.
+            unsafe {
+                std::env::remove_var("ORT_DYLIB_PATH");
+            }
+        }
+        assert!(result.is_err());
     }
 }

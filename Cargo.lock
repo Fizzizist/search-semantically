@@ -1812,6 +1812,7 @@ dependencies = [
  "anyhow",
  "dirs",
  "ignore",
+ "libloading",
  "ndarray",
  "ort",
  "reqwest",
