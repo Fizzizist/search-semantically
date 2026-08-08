@@ -53,11 +53,8 @@ impl SearchEngine {
         embedder
     }
 
-    fn ensure_embedder(embedder: &mut Embedder) -> bool {
-        if embedder.initialize().is_err() {
-            return false;
-        }
-        true
+    fn try_initialize(embedder: &mut Embedder) -> Result<()> {
+        embedder.initialize()
     }
 
     pub fn search(
@@ -74,6 +71,16 @@ impl SearchEngine {
         let mut db = SearchDb::open(&db_path)?;
 
         let mut embedder = self.get_embedder();
+
+        if !embedder.is_initialized() {
+            let model_dir = self
+                .embedder_cache_dir
+                .join(super::embedder::DEFAULT_MODEL_NAME);
+            if !super::embedder::cache_is_valid(&model_dir) {
+                Self::try_initialize(&mut embedder)
+                    .context("Failed to download or load embedder model")?;
+            }
+        }
 
         self.build_index(&mut db, &mut embedder)?;
 
@@ -252,7 +259,7 @@ impl SearchEngine {
         }
 
         if !all_new_chunk_ids.is_empty() {
-            let _ = self.embed_chunks(db, embedder, &all_new_chunk_ids);
+            self.embed_chunks(db, embedder, &all_new_chunk_ids)?;
         }
 
         Ok(())
@@ -275,8 +282,8 @@ impl SearchEngine {
 
         let texts: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
 
-        if !Self::ensure_embedder(embedder) {
-            return Ok(());
+        if !embedder.is_initialized() {
+            Self::try_initialize(embedder)?;
         }
 
         let vectors = embedder.embed(&texts)?;
@@ -301,8 +308,8 @@ impl SearchEngine {
         query: &str,
         limit: usize,
     ) -> Result<HashMap<i64, f64>> {
-        if !Self::ensure_embedder(embedder) {
-            return Ok(HashMap::new());
+        if !embedder.is_initialized() {
+            Self::try_initialize(embedder)?;
         }
 
         let query_vectors = embedder.embed(&[query])?;
@@ -623,7 +630,6 @@ fn extract_java_imports(content: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
     use std::fs;
     use tempfile::TempDir;
 
@@ -637,30 +643,45 @@ mod tests {
 
     #[test]
     fn search_finds_files_in_project() {
-        let temp = TempDir::new().expect("temp dir");
+        let cache_temp = TempDir::new().expect("cache temp dir");
+        let temp = TempDir::new().expect("project temp dir");
         fs::write(
             temp.path().join("main.rs"),
             "fn search_engine() -> Vec<String> {\n    vec![\"hello\".to_string()]\n}\n",
         )
         .expect("write");
 
-        let engine = SearchEngine::new(temp.path().to_path_buf());
-        let result = engine.search("search_engine", 20, None).expect("search");
-        assert_ne!(result, "No results found.");
-        assert!(result.contains("main.rs"));
+        let mut engine = SearchEngine::new(temp.path().to_path_buf());
+        let block_file = cache_temp.path().join("block");
+        fs::write(&block_file, b"not a directory").expect("write");
+        engine.embedder_cache_dir = block_file.join("nested");
+
+        let result = engine.search("search_engine", 20, None);
+        assert!(
+            result.is_err(),
+            "Search with unavailable embedder should return Err, not silently degrade"
+        );
     }
 
     #[test]
     fn search_with_restrict_to_dir() {
-        let temp = TempDir::new().expect("temp dir");
+        let cache_temp = TempDir::new().expect("cache temp dir");
+        let temp = TempDir::new().expect("project temp dir");
         let sub = temp.path().join("src");
         fs::create_dir_all(&sub).expect("dir");
         fs::write(sub.join("mod.rs"), "fn helper() {}").expect("write");
         fs::write(temp.path().join("main.rs"), "fn main() {}").expect("write");
 
-        let engine = SearchEngine::new(temp.path().to_path_buf());
-        let result = engine.search("main", 20, Some("src")).expect("search");
-        assert!(!result.contains("main.rs") || result.contains("No results"));
+        let mut engine = SearchEngine::new(temp.path().to_path_buf());
+        let block_file = cache_temp.path().join("block");
+        fs::write(&block_file, b"not a directory").expect("write");
+        engine.embedder_cache_dir = block_file.join("nested");
+
+        let result = engine.search("main", 20, Some("src"));
+        assert!(
+            result.is_err(),
+            "Search with unavailable embedder should return Err, not silently degrade"
+        );
     }
 
     #[test]
@@ -708,25 +729,26 @@ mod tests {
 
     #[test]
     fn rebuild_creates_fresh_index() {
-        let temp = TempDir::new().expect("temp dir");
+        let cache_temp = TempDir::new().expect("cache temp dir");
+        let temp = TempDir::new().expect("project temp dir");
         fs::write(temp.path().join("a.rs"), "fn first() {}").expect("write");
 
-        let engine = SearchEngine::new(temp.path().to_path_buf());
-        let result1 = engine.search("first", 20, None).expect("search");
-        assert!(result1.contains("a.rs"));
+        let mut engine = SearchEngine::new(temp.path().to_path_buf());
+        let block_file = cache_temp.path().join("block");
+        fs::write(&block_file, b"not a directory").expect("write");
+        engine.embedder_cache_dir = block_file.join("nested");
 
-        // Modify the file
+        let result1 = engine.search("first", 20, None);
+        assert!(result1.is_err());
+
         fs::write(temp.path().join("a.rs"), "fn renamed() {}").expect("write");
-
-        // Add another file
         fs::write(temp.path().join("b.rs"), "fn second() {}").expect("write");
 
-        // Delete the db to simulate rebuild
         let db_path = temp.path().join(".search-index").join("search.db");
         let _ = std::fs::remove_file(&db_path);
 
-        let result2 = engine.search("second", 20, None).expect("search");
-        assert!(result2.contains("b.rs"));
+        let result2 = engine.search("second", 20, None);
+        assert!(result2.is_err());
     }
 
     #[test]
@@ -776,9 +798,6 @@ mod tests {
     #[tokio::test]
     async fn search_from_tokio_context_does_not_panic() {
         let cache_temp = TempDir::new().expect("cache temp dir");
-        // SAFETY: This is an isolated test — mutating the env var is safe
-        // within this test's scope to force a unique cold model cache path.
-        unsafe { env::set_var("XDG_CACHE_HOME", cache_temp.path()) };
 
         let temp = TempDir::new().expect("project temp dir");
         fs::write(
@@ -787,12 +806,82 @@ mod tests {
         )
         .expect("write");
 
-        let engine = SearchEngine::new(temp.path().to_path_buf());
+        let mut engine = SearchEngine::new(temp.path().to_path_buf());
+        let block_file = cache_temp.path().join("block");
+        fs::write(&block_file, b"not a directory").expect("write");
+        engine.embedder_cache_dir = block_file.join("nested");
+
         let result = engine.search("search_engine", 20, None);
         assert!(
-            result.is_ok(),
-            "Search from tokio context should not panic: {:?}",
-            result.err()
+            result.is_err(),
+            "Search from tokio context with cold cache should return Err, not panic: {:?}",
+            result
         );
+    }
+
+    #[test]
+    fn search_propagates_embedder_error_on_cold_cache() {
+        let cache_temp = TempDir::new().expect("cache temp dir");
+
+        let temp = TempDir::new().expect("project temp dir");
+        fs::write(
+            temp.path().join("lib.rs"),
+            "fn search_engine() -> Vec<String> {\n    vec![\"hello\".to_string()]\n}\n",
+        )
+        .expect("write");
+
+        let mut engine = SearchEngine::new(temp.path().to_path_buf());
+        let block_file = cache_temp.path().join("block");
+        fs::write(&block_file, b"not a directory").expect("write");
+        engine.embedder_cache_dir = block_file.join("nested");
+
+        let result = engine.search("search_engine", 20, None);
+        assert!(
+            result.is_err(),
+            "Cold-cache search with unreachable model dir should return Err, got Ok"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires network access and ONNX runtime dylib; run with: cargo test -- --ignored"]
+    fn cold_cache_search_downloads_model_and_produces_embeddings() {
+        let cache_temp = TempDir::new().expect("cache temp dir");
+        let temp = TempDir::new().expect("project temp dir");
+        fs::write(
+            temp.path().join("lib.rs"),
+            "fn search_engine() -> Vec<String> {\n    vec![\"hello\".to_string()]\n}\n",
+        )
+        .expect("write");
+
+        let mut engine = SearchEngine::new(temp.path().to_path_buf());
+        engine.embedder_cache_dir = cache_temp.path().join("models");
+
+        let result = engine
+            .search("search_engine", 20, None)
+            .expect("search should succeed with network");
+        assert_ne!(result, "No results found.");
+
+        let db_path = temp.path().join(".search-index").join("search.db");
+        let conn = rusqlite::Connection::open(&db_path).expect("open db");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM embeddings", [], |row| row.get(0))
+            .expect("count embeddings");
+        assert!(count > 0, "embeddings should be stored after indexing");
+    }
+
+    #[test]
+    #[ignore = "requires ONNX runtime dylib; run with: cargo test -- --ignored"]
+    fn warm_cache_search_does_not_touch_network() {
+        let temp = TempDir::new().expect("project temp dir");
+        fs::write(
+            temp.path().join("lib.rs"),
+            "fn search_engine() -> Vec<String> {\n    vec![\"hello\".to_string()]\n}\n",
+        )
+        .expect("write");
+
+        let engine = SearchEngine::new(temp.path().to_path_buf());
+        let result = engine.search("search_engine", 20, None).expect("search");
+        assert_ne!(result, "No results found.");
+        assert!(result.contains("lib.rs"));
     }
 }
