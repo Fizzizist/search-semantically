@@ -193,21 +193,7 @@ fn onnx_runtime_dylib_name() -> &'static str {
 fn verify_onnx_runtime() -> Result<()> {
     let dylib_name = onnx_runtime_dylib_name();
 
-    let path = match std::env::var("ORT_DYLIB_PATH") {
-        Ok(s) if !s.is_empty() => std::path::PathBuf::from(s),
-        _ => {
-            let relative = std::env::current_exe()
-                .context("Could not determine current executable path")?
-                .parent()
-                .context("Executable has no parent directory")?
-                .join(dylib_name);
-            if relative.exists() {
-                relative
-            } else {
-                std::path::PathBuf::from(dylib_name)
-            }
-        }
-    };
+    let path = resolve_dylib_path(dylib_name);
 
     let lib = unsafe { libloading::Library::new(&path) }.map_err(|e| {
         anyhow::anyhow!(
@@ -229,7 +215,66 @@ fn verify_onnx_runtime() -> Result<()> {
 
     std::mem::forget(lib);
 
+    // Set ORT_DYLIB_PATH so ort's own resolution also finds the dylib,
+    // preventing the OnceLock poisoning deadlock in ort's setup_api.
+    if std::env::var("ORT_DYLIB_PATH").is_err() && path.is_absolute() && path.exists() {
+        // SAFETY: single-threaded init context; ort reads this once during
+        // setup_api, which happens after this function returns.
+        unsafe {
+            std::env::set_var("ORT_DYLIB_PATH", &path);
+        }
+    }
+
     Ok(())
+}
+
+fn resolve_dylib_path(dylib_name: &str) -> PathBuf {
+    if let Ok(s) = std::env::var("ORT_DYLIB_PATH")
+        && !s.is_empty()
+    {
+        return PathBuf::from(s);
+    }
+
+    let exe_relative = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .map(|dir| dir.join(dylib_name));
+    if let Some(ref p) = exe_relative
+        && p.exists()
+    {
+        return p.clone();
+    }
+
+    #[cfg(unix)]
+    {
+        if let Some(resolved) = resolve_via_ldconfig(dylib_name) {
+            return resolved;
+        }
+    }
+
+    PathBuf::from(dylib_name)
+}
+
+#[cfg(unix)]
+fn resolve_via_ldconfig(dylib_name: &str) -> Option<PathBuf> {
+    let output = std::process::Command::new("ldconfig")
+        .arg("-p")
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8(output.stdout).ok()?;
+
+    let soname = format!("\t{dylib_name}.");
+    for line in stdout.lines() {
+        if (line.contains(&soname) || line.contains(&format!("\t{dylib_name} ")))
+            && let Some(path_part) = line.rsplit(" => ").next()
+        {
+            let path = path_part.trim();
+            if !path.is_empty() {
+                return Some(PathBuf::from(path));
+            }
+        }
+    }
+    None
 }
 
 fn detect_dimension(session: &Session) -> usize {
