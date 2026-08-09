@@ -245,12 +245,12 @@ pub fn compute_import_graph_scores(
 pub fn compute_git_recency_scores(
     project_root: &std::path::Path,
     chunks: &[StoredChunk],
-) -> std::collections::HashMap<i64, f64> {
+) -> (std::collections::HashMap<i64, f64>, bool) {
     let mut scores = std::collections::HashMap::new();
     const NEUTRAL_SCORE: f64 = 0.5;
 
     if chunks.is_empty() {
-        return scores;
+        return (scores, false);
     }
 
     let unique_paths: std::collections::HashSet<&str> =
@@ -262,7 +262,7 @@ pub fn compute_git_recency_scores(
         for chunk in chunks {
             scores.insert(chunk.id, NEUTRAL_SCORE);
         }
-        return scores;
+        return (scores, false);
     }
 
     let oldest = file_timestamps
@@ -283,7 +283,7 @@ pub fn compute_git_recency_scores(
         scores.insert(chunk.id, score);
     }
 
-    scores
+    (scores, true)
 }
 
 fn get_file_timestamps(
@@ -455,7 +455,63 @@ mod tests {
             file_type: "rust".to_string(),
         }];
 
-        let scores = compute_git_recency_scores(temp.path(), &chunks);
+        let (scores, active) = compute_git_recency_scores(temp.path(), &chunks);
         assert_eq!(scores[&1], 0.5);
+        assert!(!active);
+    }
+
+    #[test]
+    fn git_recency_returns_active_flag_when_git_present() {
+        let git_available = std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !git_available {
+            return;
+        }
+
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(temp.path())
+            .output()
+            .expect("git init");
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(temp.path())
+            .output()
+            .expect("git config email");
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(temp.path())
+            .output()
+            .expect("git config name");
+        std::fs::write(temp.path().join("test.rs"), "fn test() {}\n").expect("write file");
+        std::process::Command::new("git")
+            .args(["add", "test.rs"])
+            .current_dir(temp.path())
+            .output()
+            .expect("git add");
+        std::process::Command::new("git")
+            .args(["commit", "-m", "initial commit"])
+            .current_dir(temp.path())
+            .output()
+            .expect("git commit");
+
+        let chunks = vec![StoredChunk {
+            id: 1,
+            file_id: 1,
+            file_path: "test.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+            kind: "file".to_string(),
+            name: None,
+            content: String::new(),
+            file_type: "rust".to_string(),
+        }];
+
+        let (_scores, active) = compute_git_recency_scores(temp.path(), &chunks);
+        assert!(active);
     }
 }

@@ -9,7 +9,7 @@ use super::embedder::{DEFAULT_MODEL_NAME, DownloadCallback, Embedder};
 use super::format::{SearchResult, format_results};
 use super::metrics;
 use super::query_classifier::classify_query;
-use super::ranker::{MetricScores, poem_rank};
+use super::ranker::{MetricAvailability, MetricScores, poem_rank};
 use super::scanner;
 use super::vector_store;
 
@@ -42,6 +42,12 @@ impl SearchEngine {
 
     pub fn set_download_callback(&mut self, callback: DownloadCallback) {
         self.download_callback = Some(callback);
+    }
+
+    pub fn prepare(&self) -> Result<()> {
+        let mut embedder = self.get_embedder();
+        embedder.initialize()?;
+        Ok(())
     }
 
     fn get_embedder(&self) -> Embedder {
@@ -101,7 +107,8 @@ impl SearchEngine {
         let import_scores =
             metrics::compute_import_graph_scores(&mut db, &filtered_seeds, &file_id_to_chunk_ids);
 
-        let recency_scores = metrics::compute_git_recency_scores(&self.project_root, &all_chunks);
+        let (recency_scores, git_recency_active) =
+            metrics::compute_git_recency_scores(&self.project_root, &all_chunks);
 
         let candidate_ids = self.collect_candidate_ids(
             &bm25_scores,
@@ -131,7 +138,21 @@ impl SearchEngine {
             return Ok(format_results(&[]));
         }
 
-        let ranked = poem_rank(&candidates, &query_type, METRIC_CANDIDATE_LIMIT);
+        let availability = MetricAvailability {
+            bm25: true,
+            cosine: !cosine_scores.is_empty(),
+            path_match: true,
+            symbol_match: true,
+            import_graph: true,
+            git_recency: git_recency_active,
+        };
+
+        let ranked = poem_rank(
+            &candidates,
+            &query_type,
+            METRIC_CANDIDATE_LIMIT,
+            &availability,
+        );
 
         let chunk_map: HashMap<i64, &StoredChunk> = all_chunks.iter().map(|c| (c.id, c)).collect();
 
@@ -186,6 +207,10 @@ impl SearchEngine {
         }
 
         if to_add.is_empty() && to_update.is_empty() && to_remove.is_empty() {
+            let orphan_ids = db.get_chunk_ids_without_embedding(DEFAULT_MODEL_NAME)?;
+            if !orphan_ids.is_empty() {
+                self.embed_chunks(db, embedder, &orphan_ids)?;
+            }
             return Ok(());
         }
 
@@ -245,6 +270,11 @@ impl SearchEngine {
 
         if !all_new_chunk_ids.is_empty() {
             self.embed_chunks(db, embedder, &all_new_chunk_ids)?;
+        }
+
+        let orphan_ids = db.get_chunk_ids_without_embedding(DEFAULT_MODEL_NAME)?;
+        if !orphan_ids.is_empty() {
+            self.embed_chunks(db, embedder, &orphan_ids)?;
         }
 
         Ok(())
@@ -329,13 +359,17 @@ impl SearchEngine {
         import: &HashMap<i64, f64>,
         recency: &HashMap<i64, f64>,
     ) -> Vec<i64> {
-        let mut ids = std::collections::HashSet::new();
-        for map in &[bm25, cosine, path, symbol, import, recency] {
-            for &id in map.keys() {
-                ids.insert(id);
+        let mut ids: Vec<i64> = {
+            let mut set = std::collections::HashSet::new();
+            for map in &[bm25, cosine, path, symbol, import, recency] {
+                for &id in map.keys() {
+                    set.insert(id);
+                }
             }
-        }
-        ids.into_iter().collect()
+            set.into_iter().collect::<Vec<_>>()
+        };
+        ids.sort_unstable();
+        ids
     }
 
     fn aggregate_file_scores(
@@ -868,5 +902,120 @@ mod tests {
         let result = engine.search("search_engine", 20, None).expect("search");
         assert_ne!(result, "No results found.");
         assert!(result.contains("lib.rs"));
+    }
+
+    #[test]
+    fn collect_candidate_ids_returns_sorted() {
+        let engine = SearchEngine::new(std::env::temp_dir());
+        let mut bm25 = HashMap::new();
+        bm25.insert(3_i64, 0.5);
+        bm25.insert(1_i64, 0.3);
+        bm25.insert(4_i64, 0.1);
+        let mut cosine = HashMap::new();
+        cosine.insert(2_i64, 0.8);
+        cosine.insert(1_i64, 0.2);
+        let path = HashMap::new();
+        let symbol = HashMap::new();
+        let import = HashMap::new();
+        let recency = HashMap::new();
+
+        let ids = engine.collect_candidate_ids(&bm25, &cosine, &path, &symbol, &import, &recency);
+        assert_eq!(ids, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn prepare_with_invalid_cache_dir_returns_err() {
+        let cache_temp = TempDir::new().expect("cache temp dir");
+        let temp = TempDir::new().expect("project temp dir");
+
+        let mut engine = SearchEngine::new(temp.path().to_path_buf());
+        let block_file = cache_temp.path().join("block");
+        fs::write(&block_file, b"not a directory").expect("write");
+        engine.embedder_cache_dir = block_file.join("nested");
+
+        let result = engine.prepare();
+        assert!(
+            result.is_err(),
+            "prepare with unreachable cache dir should return Err"
+        );
+    }
+
+    #[test]
+    fn prepare_does_not_build_index() {
+        let cache_temp = TempDir::new().expect("cache temp dir");
+        let temp = TempDir::new().expect("project temp dir");
+
+        let mut engine = SearchEngine::new(temp.path().to_path_buf());
+        let block_file = cache_temp.path().join("block");
+        fs::write(&block_file, b"not a directory").expect("write");
+        engine.embedder_cache_dir = block_file.join("nested");
+
+        let _ = engine.prepare();
+        assert!(
+            !temp.path().join(".search-index").exists(),
+            "prepare must not create .search-index directory"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires ONNX runtime dylib; run with: cargo test -- --ignored"]
+    fn prepare_eagerly_resolves_model() {
+        let cache_temp = TempDir::new().expect("cache temp dir");
+        let temp = TempDir::new().expect("project temp dir");
+
+        let mut engine = SearchEngine::new(temp.path().to_path_buf());
+        engine.embedder_cache_dir = cache_temp.path().join("models");
+
+        engine
+            .prepare()
+            .expect("prepare should succeed with valid cache dir");
+    }
+
+    #[test]
+    #[ignore = "requires ONNX runtime dylib; run with: cargo test -- --ignored"]
+    fn orphaned_embeddings_repaired_in_build_index() {
+        let cache_temp = TempDir::new().expect("cache temp dir");
+        let temp = TempDir::new().expect("project temp dir");
+        fs::write(
+            temp.path().join("lib.rs"),
+            "fn search_engine() -> Vec<String> {\n    vec![\"hello\".to_string()]\n}\n",
+        )
+        .expect("write");
+
+        let mut engine = SearchEngine::new(temp.path().to_path_buf());
+        engine.embedder_cache_dir = cache_temp.path().join("models");
+
+        engine.prepare().expect("prepare");
+
+        let index_dir = temp.path().join(".search-index");
+        std::fs::create_dir_all(&index_dir).expect("dir");
+        let db_path = index_dir.join("search.db");
+        let mut db = SearchDb::open(&db_path).expect("db");
+        let file_id = db.upsert_file("lib.rs", 1.0, "rust").expect("file");
+        let chunk_id = db
+            .insert_chunk(
+                file_id,
+                "lib.rs",
+                1,
+                3,
+                "function",
+                Some("search_engine"),
+                "fn search_engine() {}",
+                "rust",
+            )
+            .expect("chunk");
+
+        let missing = db
+            .get_chunk_ids_without_embedding(DEFAULT_MODEL_NAME)
+            .expect("missing");
+        assert!(missing.contains(&chunk_id));
+
+        let mut embedder = engine.get_embedder();
+        engine.build_index(&mut db, &mut embedder).expect("build");
+
+        let missing_after = db
+            .get_chunk_ids_without_embedding(DEFAULT_MODEL_NAME)
+            .expect("missing after");
+        assert!(!missing_after.contains(&chunk_id));
     }
 }

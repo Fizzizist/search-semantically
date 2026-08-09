@@ -4,7 +4,14 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
-pub type DownloadCallback = Arc<dyn Fn(&str) + Send + Sync>;
+#[derive(Debug, Clone)]
+pub enum DownloadEvent {
+    Started { url: String },
+    Completed { url: String },
+    Failed { url: String, error: String },
+}
+
+pub type DownloadCallback = Arc<dyn Fn(DownloadEvent) + Send + Sync>;
 
 pub(crate) const DEFAULT_MODEL_NAME: &str = "Xenova/all-MiniLM-L6-v2";
 const DEFAULT_DIMENSION: usize = 384;
@@ -346,22 +353,15 @@ fn download_model(
             let dest = target_dir_owned.join(local_file);
             let tmp_dest = target_dir_owned.join(format!("{local_file}.tmp"));
 
-            if let Some(ref cb) = callback {
-                cb(&url);
+            if let Err(e) = download_single_file(&url, &dest, &tmp_dest, callback.as_ref()) {
+                if let Some(ref cb) = callback {
+                    cb(DownloadEvent::Failed {
+                        url: url.clone(),
+                        error: e.to_string(),
+                    });
+                }
+                return Err(e);
             }
-
-            let response = reqwest::blocking::get(&url)
-                .with_context(|| format!("HTTP request to {url}"))?
-                .error_for_status()
-                .context("HTTP request failed")?;
-            let buf = response.bytes().context("Reading response body")?;
-
-            std::fs::write(&tmp_dest, &buf)
-                .with_context(|| format!("Writing temp file {}", tmp_dest.display()))?;
-
-            std::fs::rename(&tmp_dest, &dest).with_context(|| {
-                format!("Renaming {} to {}", tmp_dest.display(), dest.display())
-            })?;
         }
         Ok(())
     });
@@ -375,6 +375,39 @@ fn download_model(
     }
 
     result
+}
+
+fn download_single_file(
+    url: &str,
+    dest: &Path,
+    tmp_dest: &Path,
+    callback: Option<&DownloadCallback>,
+) -> Result<()> {
+    if let Some(cb) = callback {
+        cb(DownloadEvent::Started {
+            url: url.to_string(),
+        });
+    }
+
+    let response = reqwest::blocking::get(url)
+        .with_context(|| format!("HTTP request to {url}"))?
+        .error_for_status()
+        .context("HTTP request failed")?;
+    let buf = response.bytes().context("Reading response body")?;
+
+    std::fs::write(tmp_dest, &buf)
+        .with_context(|| format!("Writing temp file {}", tmp_dest.display()))?;
+
+    std::fs::rename(tmp_dest, dest)
+        .with_context(|| format!("Renaming {} to {}", tmp_dest.display(), dest.display()))?;
+
+    if let Some(cb) = callback {
+        cb(DownloadEvent::Completed {
+            url: url.to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 fn cleanup_tmp_files(dir: &Path) {
@@ -502,6 +535,52 @@ mod tests {
                 file_name
             );
         }
+    }
+
+    #[test]
+    fn download_callback_receives_started_event() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+        let callback: DownloadCallback = std::sync::Arc::new(move |event: DownloadEvent| {
+            events_clone.lock().expect("lock").push(event);
+        });
+        let result = download_model(
+            "nonexistent/nonexistent-model-xyz",
+            temp_dir.path(),
+            Some(callback),
+        );
+        assert!(result.is_err());
+        let events = events.lock().expect("lock");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, DownloadEvent::Started { .. })),
+            "Should receive Started event"
+        );
+    }
+
+    #[test]
+    fn download_callback_receives_failed_event() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+        let callback: DownloadCallback = std::sync::Arc::new(move |event: DownloadEvent| {
+            events_clone.lock().expect("lock").push(event);
+        });
+        let result = download_model(
+            "nonexistent/nonexistent-model-xyz",
+            temp_dir.path(),
+            Some(callback),
+        );
+        assert!(result.is_err());
+        let events = events.lock().expect("lock");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, DownloadEvent::Failed { .. })),
+            "Should receive Failed event"
+        );
     }
 
     #[test]
