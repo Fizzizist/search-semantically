@@ -1807,11 +1807,12 @@ dependencies = [
 
 [[package]]
 name = "search-semantically"
-version = "0.1.10"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "dirs",
  "ignore",
+ "libloading",
  "ndarray",
  "ort",
  "reqwest",
