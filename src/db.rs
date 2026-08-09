@@ -30,6 +30,17 @@ pub struct SearchDb {
     conn: rusqlite::Connection,
 }
 
+fn in_clause_params(ids: &[i64]) -> (String, Vec<&dyn rusqlite::ToSql>) {
+    let placeholders: Vec<String> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect();
+    let params: Vec<&dyn rusqlite::ToSql> =
+        ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    (placeholders.join(","), params)
+}
+
 impl SearchDb {
     pub fn open(db_path: &Path) -> Result<Self> {
         if let Some(parent) = db_path.parent() {
@@ -278,17 +289,11 @@ impl SearchDb {
         let mut results = Vec::new();
 
         for chunk in chunk_ids.chunks(batch_size) {
-            let placeholders: Vec<String> = chunk
-                .iter()
-                .enumerate()
-                .map(|(i, _)| format!("?{}", i + 1))
-                .collect();
+            let (placeholders, params) = in_clause_params(chunk);
             let sql = format!(
                 "SELECT id, file_id, file_path, start_line, end_line, kind, name, content, file_type FROM chunks WHERE id IN ({})",
-                placeholders.join(",")
+                placeholders
             );
-            let params: Vec<&dyn rusqlite::ToSql> =
-                chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
             let mut stmt = self.conn.prepare(&sql)?;
             let rows = stmt.query_map(params.as_slice(), |row| {
                 Ok(StoredChunk {
@@ -486,20 +491,12 @@ impl SearchDb {
         if chunk_ids.is_empty() {
             return Ok(());
         }
-        let placeholders: Vec<String> = chunk_ids
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("?{}", i + 1))
-            .collect();
-        let sql = format!(
-            "DELETE FROM chunks WHERE id IN ({})",
-            placeholders.join(",")
-        );
-        let params: Vec<&dyn rusqlite::ToSql> = chunk_ids
-            .iter()
-            .map(|id| id as &dyn rusqlite::ToSql)
-            .collect();
-        self.conn.execute(&sql, params.as_slice())?;
+        let batch_size = 500;
+        for chunk in chunk_ids.chunks(batch_size) {
+            let (placeholders, params) = in_clause_params(chunk);
+            let sql = format!("DELETE FROM chunks WHERE id IN ({})", placeholders);
+            self.conn.execute(&sql, params.as_slice())?;
+        }
         Ok(())
     }
 

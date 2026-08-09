@@ -226,20 +226,23 @@ impl SearchEngine {
         }
 
         let mut to_process: Vec<(&scanner::ScannedFile, Option<i64>)> = Vec::new();
+        let mut claimed_paths: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
         for scanned in to_add.iter().chain(to_update.iter()) {
             let existing_id = existing_by_path.get(&scanned.file_path).map(|f| f.id);
+            claimed_paths.insert(scanned.file_path.as_str());
             to_process.push((scanned, existing_id));
         }
 
         for zc in &zero_chunk_files {
-            if !scanned_by_path.contains_key(&zc.file_path) {
+            if !scanned_by_path.contains_key(&zc.file_path)
+                || claimed_paths.contains(zc.file_path.as_str())
+            {
                 continue;
             }
-            let scanned = scanned_by_path
-                .get(&zc.file_path)
-                .expect("scanned file must exist if path is in scanned_by_path");
-            to_process.push((scanned, Some(zc.id)));
+            if let Some(scanned) = scanned_by_path.get(&zc.file_path) {
+                to_process.push((scanned, Some(zc.id)));
+            }
         }
 
         let mut all_new_chunk_ids: Vec<i64> = Vec::new();
@@ -262,7 +265,7 @@ impl SearchEngine {
 
             let imports = extract_imports(&content, &scanned.file_type);
 
-            let (file_id, chunk_ids) = db.index_file_transactional(
+            let (_, chunk_ids) = db.index_file_transactional(
                 &scanned.file_path,
                 scanned.mtime,
                 &scanned.file_type.to_string(),
@@ -271,7 +274,6 @@ impl SearchEngine {
                 &imports,
             )?;
 
-            let _ = file_id;
             all_new_chunk_ids.extend(chunk_ids);
         }
 
