@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 
 use super::chunker;
 use super::db::{SearchDb, StoredChunk};
-use super::embedder::{DownloadCallback, Embedder};
+use super::embedder::{DEFAULT_MODEL_NAME, DownloadCallback, Embedder};
 use super::format::{SearchResult, format_results};
 use super::metrics;
 use super::query_classifier::classify_query;
@@ -13,7 +13,6 @@ use super::ranker::{MetricScores, poem_rank};
 use super::scanner;
 use super::vector_store;
 
-const MODEL_NAME: &str = "Xenova/all-MiniLM-L6-v2";
 const METRIC_CANDIDATE_LIMIT: usize = 1000;
 
 #[derive(Clone)]
@@ -53,10 +52,6 @@ impl SearchEngine {
         embedder
     }
 
-    fn try_initialize(embedder: &mut Embedder) -> Result<()> {
-        embedder.initialize()
-    }
-
     pub fn search(
         &self,
         query: &str,
@@ -72,15 +67,9 @@ impl SearchEngine {
 
         let mut embedder = self.get_embedder();
 
-        if !embedder.is_initialized() {
-            let model_dir = self
-                .embedder_cache_dir
-                .join(super::embedder::DEFAULT_MODEL_NAME);
-            if !super::embedder::cache_is_valid(&model_dir) {
-                Self::try_initialize(&mut embedder)
-                    .context("Failed to download or load embedder model")?;
-            }
-        }
+        embedder
+            .initialize()
+            .context("Failed to download or load embedder model")?;
 
         self.build_index(&mut db, &mut embedder)?;
 
@@ -283,7 +272,7 @@ impl SearchEngine {
         let texts: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
 
         if !embedder.is_initialized() {
-            Self::try_initialize(embedder)?;
+            embedder.initialize()?;
         }
 
         let vectors = embedder.embed(&texts)?;
@@ -293,7 +282,7 @@ impl SearchEngine {
             .zip(vectors.iter())
             .map(|(chunk, vector)| {
                 let blob = vector_store::pack_vector(vector);
-                (chunk.id, MODEL_NAME.to_string(), blob)
+                (chunk.id, DEFAULT_MODEL_NAME.to_string(), blob)
             })
             .collect();
 
@@ -309,13 +298,13 @@ impl SearchEngine {
         limit: usize,
     ) -> Result<HashMap<i64, f64>> {
         if !embedder.is_initialized() {
-            Self::try_initialize(embedder)?;
+            embedder.initialize()?;
         }
 
         let query_vectors = embedder.embed(&[query])?;
         let query_vector = &query_vectors[0];
 
-        let stored = db.get_all_embeddings(MODEL_NAME)?;
+        let stored = db.get_all_embeddings(DEFAULT_MODEL_NAME)?;
         if stored.is_empty() {
             return Ok(HashMap::new());
         }

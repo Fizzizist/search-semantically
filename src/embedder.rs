@@ -60,7 +60,8 @@ impl Embedder {
         let onnx_path = model_dir.join("model.onnx");
         let tokenizer_path = model_dir.join("tokenizer.json");
 
-        verify_onnx_runtime()?;
+        let dylib_path = resolve_onnx_runtime()?;
+        configure_onnx_runtime(&dylib_path);
 
         let session = Session::builder()
             .context("Creating ONNX session builder")?
@@ -190,9 +191,10 @@ fn onnx_runtime_dylib_name() -> &'static str {
     }
 }
 
-fn verify_onnx_runtime() -> Result<()> {
-    let dylib_name = onnx_runtime_dylib_name();
+static ORT_DYLIB_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
+fn resolve_onnx_runtime() -> Result<PathBuf> {
+    let dylib_name = onnx_runtime_dylib_name();
     let path = resolve_dylib_path(dylib_name);
 
     let lib = unsafe { libloading::Library::new(&path) }.map_err(|e| {
@@ -215,17 +217,25 @@ fn verify_onnx_runtime() -> Result<()> {
 
     std::mem::forget(lib);
 
-    // Set ORT_DYLIB_PATH so ort's own resolution also finds the dylib,
-    // preventing the OnceLock poisoning deadlock in ort's setup_api.
-    if std::env::var("ORT_DYLIB_PATH").is_err() && path.is_absolute() && path.exists() {
-        // SAFETY: single-threaded init context; ort reads this once during
-        // setup_api, which happens after this function returns.
-        unsafe {
-            std::env::set_var("ORT_DYLIB_PATH", &path);
-        }
+    Ok(path)
+}
+
+fn configure_onnx_runtime(dylib_path: &Path) {
+    if !dylib_path.is_absolute() || !dylib_path.exists() {
+        return;
     }
 
-    Ok(())
+    ORT_DYLIB_INIT.get_or_init(|| {
+        if std::env::var("ORT_DYLIB_PATH").is_err() {
+            // SAFETY: guarded by OnceLock so the write happens at most once
+            // process-wide, before any ort session is created. Callers that
+            // need to set ORT_DYLIB_PATH themselves should do so before
+            // constructing a SearchEngine.
+            unsafe {
+                std::env::set_var("ORT_DYLIB_PATH", dylib_path);
+            }
+        }
+    });
 }
 
 fn resolve_dylib_path(dylib_name: &str) -> PathBuf {
@@ -495,36 +505,37 @@ mod tests {
     }
 
     #[test]
-    fn verify_onnx_runtime_missing_dylib_returns_error() {
+    fn resolve_onnx_runtime_missing_dylib_returns_error() {
         let orig = std::env::var("ORT_DYLIB_PATH").ok();
         // SAFETY: isolated test — temporarily clearing ORT_DYLIB_PATH to force
-        // the probe to search the default dlopen path, which has no dylib.
+        // the probe to search the default dlopen path.
         unsafe {
             std::env::remove_var("ORT_DYLIB_PATH");
         }
-        let result = verify_onnx_runtime();
+        let result = resolve_onnx_runtime();
         if let Some(v) = orig {
             // SAFETY: restoring the original env var after the probe.
             unsafe {
                 std::env::set_var("ORT_DYLIB_PATH", v);
             }
         }
-        if std::env::var("ORT_DYLIB_PATH").is_ok() {
-            return;
+        match result {
+            Ok(_) => {
+                // The dylib is installed on this machine — the "missing dylib"
+                // path cannot be exercised. Skip without failing.
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("ONNX Runtime") || msg.contains("ORT_DYLIB_PATH"),
+                    "Error should guide user to install or set ORT_DYLIB_PATH, got: {msg}"
+                );
+            }
         }
-        assert!(
-            result.is_err(),
-            "verify_onnx_runtime should fail when no dylib is installed"
-        );
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("ONNX Runtime") || msg.contains("ORT_DYLIB_PATH"),
-            "Error should guide user to install or set ORT_DYLIB_PATH, got: {msg}"
-        );
     }
 
     #[test]
-    fn verify_onnx_runtime_bad_dylib_path_returns_error() {
+    fn resolve_onnx_runtime_bad_dylib_path_returns_error() {
         let temp_dir = TempDir::new().expect("temp dir");
         let fake_dylib = temp_dir.path().join("libonnxruntime.so");
         fs::write(&fake_dylib, b"not a shared library").expect("write");
@@ -535,7 +546,7 @@ mod tests {
         unsafe {
             std::env::set_var("ORT_DYLIB_PATH", &fake_dylib);
         }
-        let result = verify_onnx_runtime();
+        let result = resolve_onnx_runtime();
         if let Some(v) = orig {
             // SAFETY: restoring the original env var.
             unsafe {
@@ -548,5 +559,25 @@ mod tests {
             }
         }
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn configure_onnx_runtime_guards_against_relative_path() {
+        let orig = std::env::var("ORT_DYLIB_PATH").ok();
+        // SAFETY: isolated test.
+        unsafe {
+            std::env::remove_var("ORT_DYLIB_PATH");
+        }
+        configure_onnx_runtime(std::path::Path::new("relative/path/libonnxruntime.so"));
+        assert!(
+            std::env::var("ORT_DYLIB_PATH").is_err(),
+            "Relative path must not be written to env"
+        );
+        if let Some(v) = orig {
+            // SAFETY: restoring original env var.
+            unsafe {
+                std::env::set_var("ORT_DYLIB_PATH", v);
+            }
+        }
     }
 }
