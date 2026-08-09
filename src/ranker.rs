@@ -90,7 +90,7 @@ fn get_weight(weights: &ColumnWeights, metric: &str) -> usize {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct MetricAvailability {
     pub bm25: bool,
     pub cosine: bool,
@@ -155,6 +155,20 @@ pub fn poem_rank(
         .filter(|m| availability.is_active(m))
         .map(|m| get_weight(&weights, m))
         .sum::<usize>() as f64;
+
+    if total_weight == 0.0 {
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| ids[a].cmp(&ids[b]));
+        return order
+            .into_iter()
+            .enumerate()
+            .map(|(rank, i)| RankedCandidate {
+                id: ids[i],
+                scores: scores[i].clone(),
+                rank,
+            })
+            .collect();
+    }
 
     let mut counts = vec![0u16; n * n];
 
@@ -618,6 +632,40 @@ mod tests {
         // the bm25 gap dominant; both should still rank 1 first.
         assert_eq!(r_full[0].id, 1);
         assert_eq!(r_masked[0].id, 1);
+    }
+
+    #[test]
+    fn all_metrics_inactive_returns_sorted_by_id() {
+        let mut candidates = std::collections::HashMap::new();
+        let s = MetricScores {
+            bm25: 0.5,
+            cosine: 0.5,
+            path_match: 0.5,
+            symbol_match: 0.5,
+            import_graph: 0.5,
+            git_recency: 0.5,
+        };
+        candidates.insert(3, s.clone());
+        candidates.insert(1, s.clone());
+        candidates.insert(2, s.clone());
+
+        let inactive = MetricAvailability {
+            bm25: false,
+            cosine: false,
+            path_match: false,
+            symbol_match: false,
+            import_graph: false,
+            git_recency: false,
+        };
+
+        let result = poem_rank(&candidates, &QueryType::Identifier, 1000, &inactive);
+        let ids: Vec<i64> = result.iter().map(|r| r.id).collect();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3],
+            "all-inactive should return sorted by ID"
+        );
+        assert_eq!(result.len(), 3);
     }
 
     #[test]

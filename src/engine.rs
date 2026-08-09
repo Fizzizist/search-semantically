@@ -207,10 +207,7 @@ impl SearchEngine {
         }
 
         if to_add.is_empty() && to_update.is_empty() && to_remove.is_empty() {
-            let orphan_ids = db.get_chunk_ids_without_embedding(DEFAULT_MODEL_NAME)?;
-            if !orphan_ids.is_empty() {
-                self.embed_chunks(db, embedder, &orphan_ids)?;
-            }
+            self.repair_orphan_embeddings(db, embedder)?;
             return Ok(());
         }
 
@@ -272,11 +269,16 @@ impl SearchEngine {
             self.embed_chunks(db, embedder, &all_new_chunk_ids)?;
         }
 
+        self.repair_orphan_embeddings(db, embedder)?;
+
+        Ok(())
+    }
+
+    fn repair_orphan_embeddings(&self, db: &mut SearchDb, embedder: &mut Embedder) -> Result<()> {
         let orphan_ids = db.get_chunk_ids_without_embedding(DEFAULT_MODEL_NAME)?;
         if !orphan_ids.is_empty() {
             self.embed_chunks(db, embedder, &orphan_ids)?;
         }
-
         Ok(())
     }
 
@@ -359,15 +361,12 @@ impl SearchEngine {
         import: &HashMap<i64, f64>,
         recency: &HashMap<i64, f64>,
     ) -> Vec<i64> {
-        let mut ids: Vec<i64> = {
-            let mut set = std::collections::HashSet::new();
-            for map in &[bm25, cosine, path, symbol, import, recency] {
-                for &id in map.keys() {
-                    set.insert(id);
-                }
-            }
-            set.into_iter().collect::<Vec<_>>()
-        };
+        let mut ids: Vec<i64> = [bm25, cosine, path, symbol, import, recency]
+            .iter()
+            .flat_map(|m| m.keys().copied())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
         ids.sort_unstable();
         ids
     }
@@ -1017,5 +1016,111 @@ mod tests {
             .get_chunk_ids_without_embedding(DEFAULT_MODEL_NAME)
             .expect("missing after");
         assert!(!missing_after.contains(&chunk_id));
+    }
+
+    #[test]
+    fn orphan_repair_runs_in_build_index_no_changes_path() {
+        let cache_temp = TempDir::new().expect("cache temp dir");
+        let temp = TempDir::new().expect("project temp dir");
+        fs::write(temp.path().join("lib.rs"), "fn foo() {}\n").expect("write");
+
+        let mut engine = SearchEngine::new(temp.path().to_path_buf());
+        let block_file = cache_temp.path().join("block");
+        fs::write(&block_file, b"not a directory").expect("write");
+        engine.embedder_cache_dir = block_file.join("nested");
+
+        let scanned = scanner::scan_project(temp.path());
+        let mtime = scanned
+            .iter()
+            .find(|f| f.file_path == "lib.rs")
+            .map(|f| f.mtime)
+            .expect("scanned file");
+
+        let index_dir = temp.path().join(".search-index");
+        std::fs::create_dir_all(&index_dir).expect("dir");
+        let db_path = index_dir.join("search.db");
+        let mut db = SearchDb::open(&db_path).expect("db");
+        let file_id = db.upsert_file("lib.rs", mtime, "rust").expect("file");
+        let chunk_id = db
+            .insert_chunk(
+                file_id,
+                "lib.rs",
+                1,
+                1,
+                "function",
+                Some("foo"),
+                "fn foo() {}",
+                "rust",
+            )
+            .expect("chunk");
+
+        let orphans = db
+            .get_chunk_ids_without_embedding(DEFAULT_MODEL_NAME)
+            .expect("orphans");
+        assert!(orphans.contains(&chunk_id));
+
+        let mut embedder = engine.get_embedder();
+        let result = engine.build_index(&mut db, &mut embedder);
+
+        assert!(
+            result.is_err(),
+            "build_index should error when orphan repair triggers embedder init with bad cache dir"
+        );
+    }
+
+    #[test]
+    fn orphan_repair_skips_when_no_orphans() {
+        let cache_temp = TempDir::new().expect("cache temp dir");
+        let temp = TempDir::new().expect("project temp dir");
+        fs::write(temp.path().join("lib.rs"), "fn foo() {}\n").expect("write");
+
+        let mut engine = SearchEngine::new(temp.path().to_path_buf());
+        let block_file = cache_temp.path().join("block");
+        fs::write(&block_file, b"not a directory").expect("write");
+        engine.embedder_cache_dir = block_file.join("nested");
+
+        let scanned = scanner::scan_project(temp.path());
+        let mtime = scanned
+            .iter()
+            .find(|f| f.file_path == "lib.rs")
+            .map(|f| f.mtime)
+            .expect("scanned file");
+
+        let index_dir = temp.path().join(".search-index");
+        std::fs::create_dir_all(&index_dir).expect("dir");
+        let db_path = index_dir.join("search.db");
+        let mut db = SearchDb::open(&db_path).expect("db");
+        let file_id = db.upsert_file("lib.rs", mtime, "rust").expect("file");
+        let chunk_id = db
+            .insert_chunk(
+                file_id,
+                "lib.rs",
+                1,
+                1,
+                "function",
+                Some("foo"),
+                "fn foo() {}",
+                "rust",
+            )
+            .expect("chunk");
+
+        db.batch_upsert_embeddings(&[(
+            chunk_id,
+            DEFAULT_MODEL_NAME.to_string(),
+            vector_store::pack_vector(&[0.1_f32; 384]),
+        )])
+        .expect("embed");
+
+        let orphans = db
+            .get_chunk_ids_without_embedding(DEFAULT_MODEL_NAME)
+            .expect("orphans");
+        assert!(orphans.is_empty());
+
+        let mut embedder = engine.get_embedder();
+        let result = engine.build_index(&mut db, &mut embedder);
+        assert!(
+            result.is_ok(),
+            "build_index should succeed when no orphans exist, even with bad embedder"
+        );
     }
 }
