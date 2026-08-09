@@ -175,6 +175,7 @@ impl SearchEngine {
     fn build_index(&self, db: &mut SearchDb, embedder: &mut Embedder) -> Result<()> {
         let scanned_files = scanner::scan_project(&self.project_root);
         let existing_files = db.get_all_files()?;
+        let zero_chunk_files = db.get_files_with_zero_chunks()?;
 
         let existing_by_path: HashMap<String, _> = existing_files
             .iter()
@@ -206,7 +207,16 @@ impl SearchEngine {
             }
         }
 
-        if to_add.is_empty() && to_update.is_empty() && to_remove.is_empty() {
+        let orphaned_chunks = db.get_orphaned_chunk_ids()?;
+        if !orphaned_chunks.is_empty() {
+            db.delete_chunks_by_ids(&orphaned_chunks)?;
+        }
+
+        if to_add.is_empty()
+            && to_update.is_empty()
+            && to_remove.is_empty()
+            && zero_chunk_files.is_empty()
+        {
             self.repair_orphan_embeddings(db, embedder)?;
             return Ok(());
         }
@@ -215,13 +225,26 @@ impl SearchEngine {
             db.delete_file(file.id)?;
         }
 
-        let files_to_process: Vec<_> = to_add
-            .into_iter()
-            .chain(to_update.iter().copied())
-            .collect();
+        let mut to_process: Vec<(&scanner::ScannedFile, Option<i64>)> = Vec::new();
+
+        for scanned in to_add.iter().chain(to_update.iter()) {
+            let existing_id = existing_by_path.get(&scanned.file_path).map(|f| f.id);
+            to_process.push((scanned, existing_id));
+        }
+
+        for zc in &zero_chunk_files {
+            if !scanned_by_path.contains_key(&zc.file_path) {
+                continue;
+            }
+            let scanned = scanned_by_path
+                .get(&zc.file_path)
+                .expect("scanned file must exist if path is in scanned_by_path");
+            to_process.push((scanned, Some(zc.id)));
+        }
+
         let mut all_new_chunk_ids: Vec<i64> = Vec::new();
 
-        for scanned in &files_to_process {
+        for (scanned, existing_id) in &to_process {
             let abs_path = self.project_root.join(&scanned.file_path);
             let content = match std::fs::read_to_string(&abs_path) {
                 Ok(c) => c,
@@ -230,39 +253,26 @@ impl SearchEngine {
 
             let chunks = chunker::chunk_file(&content, &scanned.file_path, &scanned.file_type);
 
-            let file_id = db.upsert_file(
-                &scanned.file_path,
-                scanned.mtime,
-                &scanned.file_type.to_string(),
-            )?;
-
-            if let Some(existing) = existing_by_path.get(&scanned.file_path) {
-                db.delete_chunks_for_file(existing.id)?;
-                let _ = db.delete_imports_for_file(existing.id);
-            }
-
-            for text_chunk in &chunks {
-                let chunk_id = db.insert_chunk(
-                    file_id,
-                    &text_chunk.file_path,
-                    text_chunk.start_line as i64,
-                    text_chunk.end_line as i64,
-                    &text_chunk.kind.to_string(),
-                    text_chunk.name.as_deref(),
-                    &text_chunk.content,
-                    &scanned.file_type.to_string(),
-                )?;
-                all_new_chunk_ids.push(chunk_id);
-
-                if let Some(name) = &text_chunk.name {
-                    db.insert_symbol(chunk_id, name, &text_chunk.kind.to_string())?;
+            if chunks.is_empty() {
+                if let Some(id) = existing_id {
+                    db.delete_file(*id)?;
                 }
+                continue;
             }
 
             let imports = extract_imports(&content, &scanned.file_type);
-            for target_path in imports {
-                let _ = db.insert_import(file_id, &target_path);
-            }
+
+            let (file_id, chunk_ids) = db.index_file_transactional(
+                &scanned.file_path,
+                scanned.mtime,
+                &scanned.file_type.to_string(),
+                *existing_id,
+                &chunks,
+                &imports,
+            )?;
+
+            let _ = file_id;
+            all_new_chunk_ids.extend(chunk_ids);
         }
 
         if !all_new_chunk_ids.is_empty() {
@@ -1121,6 +1131,215 @@ mod tests {
         assert!(
             result.is_ok(),
             "build_index should succeed when no orphans exist, even with bad embedder"
+        );
+    }
+
+    #[test]
+    fn build_index_detects_zero_chunk_corruption() {
+        let cache_temp = TempDir::new().expect("cache temp dir");
+        let temp = TempDir::new().expect("project temp dir");
+        fs::write(temp.path().join("lib.rs"), "fn foo() {}\n").expect("write");
+
+        let mut engine = SearchEngine::new(temp.path().to_path_buf());
+        let block_file = cache_temp.path().join("block");
+        fs::write(&block_file, b"not a directory").expect("write");
+        engine.embedder_cache_dir = block_file.join("nested");
+
+        let scanned = scanner::scan_project(temp.path());
+        let mtime = scanned
+            .iter()
+            .find(|f| f.file_path == "lib.rs")
+            .map(|f| f.mtime)
+            .expect("scanned file");
+
+        let index_dir = temp.path().join(".search-index");
+        std::fs::create_dir_all(&index_dir).expect("dir");
+        let db_path = index_dir.join("search.db");
+        let mut db = SearchDb::open(&db_path).expect("db");
+        db.upsert_file("lib.rs", mtime, "rust").expect("file");
+
+        let zero_chunk = db.get_files_with_zero_chunks().expect("query");
+        assert_eq!(zero_chunk.len(), 1);
+
+        let mut embedder = engine.get_embedder();
+        let result = engine.build_index(&mut db, &mut embedder);
+
+        assert!(
+            result.is_err(),
+            "build_index should error when zero-chunk repair triggers embedder init with bad cache dir"
+        );
+
+        let chunk_count = db.get_chunk_count().expect("count");
+        assert!(
+            chunk_count > 0,
+            "zero-chunk corruption should be healed — file should now have chunks"
+        );
+    }
+
+    #[test]
+    fn build_index_skips_files_with_zero_chunks_on_update() {
+        let cache_temp = TempDir::new().expect("cache temp dir");
+        let temp = TempDir::new().expect("project temp dir");
+        fs::write(temp.path().join("lib.rs"), "fn foo() {}\n").expect("write");
+
+        let mut engine = SearchEngine::new(temp.path().to_path_buf());
+        let block_file = cache_temp.path().join("block");
+        fs::write(&block_file, b"not a directory").expect("write");
+        engine.embedder_cache_dir = block_file.join("nested");
+
+        let scanned = scanner::scan_project(temp.path());
+        let mtime = scanned
+            .iter()
+            .find(|f| f.file_path == "lib.rs")
+            .map(|f| f.mtime)
+            .expect("scanned file");
+
+        let index_dir = temp.path().join(".search-index");
+        std::fs::create_dir_all(&index_dir).expect("dir");
+        let db_path = index_dir.join("search.db");
+        let mut db = SearchDb::open(&db_path).expect("db");
+        let file_id = db.upsert_file("lib.rs", mtime, "rust").expect("file");
+        db.insert_chunk(
+            file_id,
+            "lib.rs",
+            1,
+            1,
+            "function",
+            Some("foo"),
+            "fn foo() {}",
+            "rust",
+        )
+        .expect("chunk");
+
+        db.delete_chunks_for_file(file_id).expect("delete chunks");
+        let zero_chunk = db.get_files_with_zero_chunks().expect("query");
+        assert_eq!(zero_chunk.len(), 1);
+
+        let mut embedder = engine.get_embedder();
+        let result = engine.build_index(&mut db, &mut embedder);
+
+        assert!(
+            result.is_err(),
+            "build_index should error when re-chunking triggers embedder init with bad cache dir"
+        );
+
+        let chunk_count = db.get_chunk_count().expect("count");
+        assert!(chunk_count > 0, "corrupted file should be re-chunked");
+    }
+
+    #[test]
+    fn build_index_no_changes_with_healthy_index() {
+        let cache_temp = TempDir::new().expect("cache temp dir");
+        let temp = TempDir::new().expect("project temp dir");
+        fs::write(temp.path().join("lib.rs"), "fn foo() {}\n").expect("write");
+
+        let mut engine = SearchEngine::new(temp.path().to_path_buf());
+        let block_file = cache_temp.path().join("block");
+        fs::write(&block_file, b"not a directory").expect("write");
+        engine.embedder_cache_dir = block_file.join("nested");
+
+        let scanned = scanner::scan_project(temp.path());
+        let mtime = scanned
+            .iter()
+            .find(|f| f.file_path == "lib.rs")
+            .map(|f| f.mtime)
+            .expect("scanned file");
+
+        let index_dir = temp.path().join(".search-index");
+        std::fs::create_dir_all(&index_dir).expect("dir");
+        let db_path = index_dir.join("search.db");
+        let mut db = SearchDb::open(&db_path).expect("db");
+        let file_id = db.upsert_file("lib.rs", mtime, "rust").expect("file");
+        let chunk_id = db
+            .insert_chunk(
+                file_id,
+                "lib.rs",
+                1,
+                1,
+                "function",
+                Some("foo"),
+                "fn foo() {}",
+                "rust",
+            )
+            .expect("chunk");
+
+        db.batch_upsert_embeddings(&[(
+            chunk_id,
+            DEFAULT_MODEL_NAME.to_string(),
+            vector_store::pack_vector(&[0.1_f32; 384]),
+        )])
+        .expect("embed");
+
+        let mut embedder = engine.get_embedder();
+        let result = engine.build_index(&mut db, &mut embedder);
+        assert!(
+            result.is_ok(),
+            "build_index should succeed with healthy index and no changes"
+        );
+
+        let chunk_count = db.get_chunk_count().expect("count");
+        assert_eq!(chunk_count, 1);
+    }
+
+    #[test]
+    fn build_index_cleans_orphaned_chunks() {
+        let cache_temp = TempDir::new().expect("cache temp dir");
+        let temp = TempDir::new().expect("project temp dir");
+        fs::write(temp.path().join("lib.rs"), "fn foo() {}\n").expect("write");
+
+        let mut engine = SearchEngine::new(temp.path().to_path_buf());
+        let block_file = cache_temp.path().join("block");
+        fs::write(&block_file, b"not a directory").expect("write");
+        engine.embedder_cache_dir = block_file.join("nested");
+
+        let scanned = scanner::scan_project(temp.path());
+        let mtime = scanned
+            .iter()
+            .find(|f| f.file_path == "lib.rs")
+            .map(|f| f.mtime)
+            .expect("scanned file");
+
+        let index_dir = temp.path().join(".search-index");
+        std::fs::create_dir_all(&index_dir).expect("dir");
+        let db_path = index_dir.join("search.db");
+        let mut db = SearchDb::open(&db_path).expect("db");
+        let file_id = db.upsert_file("lib.rs", mtime, "rust").expect("file");
+        let chunk_id = db
+            .insert_chunk(
+                file_id,
+                "lib.rs",
+                1,
+                1,
+                "function",
+                Some("foo"),
+                "fn foo() {}",
+                "rust",
+            )
+            .expect("chunk");
+
+        db.batch_upsert_embeddings(&[(
+            chunk_id,
+            DEFAULT_MODEL_NAME.to_string(),
+            vector_store::pack_vector(&[0.1_f32; 384]),
+        )])
+        .expect("embed");
+
+        db.inject_orphaned_chunk().expect("inject orphan");
+
+        let orphans_before = db.get_orphaned_chunk_ids().expect("query");
+        assert_eq!(orphans_before.len(), 1);
+
+        let mut embedder = engine.get_embedder();
+        let result = engine.build_index(&mut db, &mut embedder);
+        assert!(
+            result.is_ok(),
+            "build_index should succeed with healthy index, cleaning orphaned chunks"
+        );
+
+        let orphans_after = db.get_orphaned_chunk_ids().expect("query");
+        assert!(
+            orphans_after.is_empty(),
+            "orphaned chunks should be cleaned"
         );
     }
 }
