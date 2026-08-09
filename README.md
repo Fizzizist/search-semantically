@@ -42,7 +42,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-search-semantically = "0.2"
+search-semantically = "0.3"
 ```
 
 Then use it:
@@ -106,8 +106,10 @@ graph TD
 | `StoredChunk` | A chunk row from the DB (id, file_id, path, lines, kind, content) |
 | `TextChunk` | In-memory chunk produced by chunkers (content, line range, kind, optional name) |
 | `MetricScores` | Six `f64` scores per candidate |
+| `MetricAvailability` | Per-metric active/inactive mask for `poem_rank` (use `all_active()` for default) |
 | `QueryType` | `Identifier` / `NaturalLanguage` / `PathLike` |
 | `FileType` | Enum of supported languages and formats |
+| `DownloadEvent` | Enum emitted to `DownloadCallback` (`Started`, `Completed`, `Failed`) |
 
 ## Building & Testing
 
