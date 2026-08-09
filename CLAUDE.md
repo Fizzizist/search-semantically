@@ -50,8 +50,10 @@ The crate uses edition 2024. Default features enable `tree-sitter-rust`. Additio
 
 1. `SearchEngine::search()` opens/creates `.search-index/search.db` in the project root
 2. `scanner` walks the project, diffing against indexed files by mtime
-3. New/changed files are chunked, embedded, and stored in SQLite
+3. New/changed files are chunked, embedded, and stored in SQLite; orphaned embeddings (from interrupted indexing) are repaired
 4. Query is classified → six metric signals computed → POEM ranking → formatted output
+
+`SearchEngine::prepare()` eagerly resolves the ONNX model without building the index; `search()` remains lazy and hard-errors on embedder failure.
 
 ### Key types
 
@@ -59,8 +61,10 @@ The crate uses edition 2024. Default features enable `tree-sitter-rust`. Additio
 - `StoredChunk` — a chunk row from the DB (id, file_id, path, lines, kind, content)
 - `TextChunk` — in-memory chunk produced by chunkers (content, line range, kind, optional name)
 - `MetricScores` — six f64 scores per candidate
+- `MetricAvailability` — per-metric active/inactive mask for `poem_rank` (use `all_active()` for default)
 - `QueryType` — `Identifier` / `NaturalLanguage` / `PathLike`
 - `FileType` — enum of supported languages (Rust, TypeScript, Python, Go, Java, C, C++, Markdown, etc.)
+- `DownloadEvent` — enum emitted to `DownloadCallback` (`Started`, `Completed`, `Failed`)
 
 ## Conventions
 

@@ -35,7 +35,7 @@ mod util;
 mod vector_store;
 
 pub use db::StoredChunk;
-pub use embedder::DownloadCallback;
+pub use embedder::{DownloadCallback, DownloadEvent};
 pub use engine::SearchEngine;
 pub use format::{SearchResult, format_results};
 pub use query_classifier::QueryType;
