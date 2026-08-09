@@ -67,10 +67,6 @@ impl SearchEngine {
 
         let mut embedder = self.get_embedder();
 
-        embedder
-            .initialize()
-            .context("Failed to download or load embedder model")?;
-
         self.build_index(&mut db, &mut embedder)?;
 
         let mut all_chunks = db.get_all_chunks()?;
