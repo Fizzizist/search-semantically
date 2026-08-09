@@ -33,7 +33,7 @@ The crate uses edition 2024. Default features enable `tree-sitter-rust`. Additio
 
 | Module | Purpose |
 |---|---|
-| `engine` | `SearchEngine` — top-level API: index + search |
+| `engine` | `SearchEngine` — top-level API: search (embeds + indexes + ranks in one call) |
 | `scanner` | Walks project dir, classifies files by `FileType`, records mtime |
 | `chunker` | Dispatches to `text_chunker` or `ts_chunker` based on file type |
 | `text_chunker` | Line/paragraph chunking for plain text formats |
@@ -69,12 +69,13 @@ The crate uses edition 2024. Default features enable `tree-sitter-rust`. Additio
 - Embedding dimension: 384 (all-MiniLM-L6-v2)
 - Candidate limit for metrics: 1000
 - The `db` module uses integer IDs (i64) for files and chunks; foreign keys enforce referential integrity
-- Error handling: `anyhow::Result` throughout
+- Error handling: `anyhow::Result` throughout; embedder download/init failures propagate as `Err` from `search()` (no silent degradation)
 - All tests use `tempfile::TempDir` for isolation
 
 ## Dependencies of note
 
 - `ort` (ONNX Runtime) — dynamic loading via `load-dynamic` feature
+- `libloading` — pre-flight dylib verification before `ort` session creation
 - `rusqlite` — bundled SQLite
 - `tree-sitter` + per-language grammars (feature-gated)
 - `tokenizers` (HuggingFace) — for embedding tokenization

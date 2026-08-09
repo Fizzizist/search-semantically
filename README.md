@@ -42,7 +42,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-search-semantically = "0.1"
+search-semantically = "0.2"
 ```
 
 Then use it:
@@ -51,12 +51,9 @@ Then use it:
 use search_semantically::SearchEngine;
 use std::path::PathBuf;
 
-let engine = SearchEngine::new(PathBuf::from("/path/to/project"))?;
-engine.index()?; // incremental — only processes new/changed files
-let results = engine.search("function that parses HTTP headers")?;
-for result in results {
-    println!("{}", result);
-}
+let engine = SearchEngine::new(PathBuf::from("/path/to/project"));
+let results = engine.search("function that parses HTTP headers", 20, None)?;
+println!("{}", results);
 ```
 
 On first run, the ONNX model (`all-MiniLM-L6-v2`, 384-dim) is downloaded and cached at `$XDG_CACHE_DIR/search-semantically/models/Xenova/all-MiniLM-L6-v2/`.
