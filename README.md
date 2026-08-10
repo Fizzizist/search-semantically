@@ -16,6 +16,7 @@ A Rust library crate that provides local, incremental code search combining BM25
 - **Tree-sitter chunking** — language-aware splitting into functions, structs, impls, etc.
 - **Multi-signal ranking** — six independent signals fused via POEM
 - **Incremental indexing** — only re-indexes files changed since last run (mtime diffing)
+- **Self-healing index** — detects zero-chunk corruption from interrupted indexing and re-chunks affected files on every search call
 - **Git-aware** — recency signal based on commit history
 - **Import graph propagation** — follows import/usage relationships to boost relevant code
 - **Zero external services** — runs entirely locally, model downloaded and cached on first use
@@ -82,10 +83,11 @@ graph TD
 
 1. `SearchEngine::search()` opens/creates `.search-index/search.db` in the project root
 2. **Scanner** walks the project, diffing against indexed files by mtime
-3. New/changed files are **chunked**, **embedded**, and stored in SQLite
-4. Query is **classified** (`Identifier` / `NaturalLanguage` / `PathLike`)
-5. Six metric signals are **computed** per candidate (up to 1000 candidates)
-6. Results are **ranked** via POEM and returned as formatted output
+3. **Index integrity** is verified: zero-chunk files (corruption from interrupted indexing) are re-queued; orphaned chunks are cleaned up
+4. New/changed/corrupted files are **chunked**, **embedded**, and stored in SQLite via per-file transactions
+5. Query is **classified** (`Identifier` / `NaturalLanguage` / `PathLike`)
+6. Six metric signals are **computed** per candidate (up to 1000 candidates)
+7. Results are **ranked** via POEM and returned as formatted output
 
 ### The Six Signals
 

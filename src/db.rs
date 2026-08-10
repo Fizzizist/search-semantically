@@ -30,6 +30,17 @@ pub struct SearchDb {
     conn: rusqlite::Connection,
 }
 
+fn in_clause_params(ids: &[i64]) -> (String, Vec<&dyn rusqlite::ToSql>) {
+    let placeholders: Vec<String> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect();
+    let params: Vec<&dyn rusqlite::ToSql> =
+        ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    (placeholders.join(","), params)
+}
+
 impl SearchDb {
     pub fn open(db_path: &Path) -> Result<Self> {
         if let Some(parent) = db_path.parent() {
@@ -278,17 +289,11 @@ impl SearchDb {
         let mut results = Vec::new();
 
         for chunk in chunk_ids.chunks(batch_size) {
-            let placeholders: Vec<String> = chunk
-                .iter()
-                .enumerate()
-                .map(|(i, _)| format!("?{}", i + 1))
-                .collect();
+            let (placeholders, params) = in_clause_params(chunk);
             let sql = format!(
                 "SELECT id, file_id, file_path, start_line, end_line, kind, name, content, file_type FROM chunks WHERE id IN ({})",
-                placeholders.join(",")
+                placeholders
             );
-            let params: Vec<&dyn rusqlite::ToSql> =
-                chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
             let mut stmt = self.conn.prepare(&sql)?;
             let rows = stmt.query_map(params.as_slice(), |row| {
                 Ok(StoredChunk {
@@ -452,6 +457,132 @@ impl SearchDb {
         self.conn
             .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
             .map_err(Into::into)
+    }
+
+    pub fn get_files_with_zero_chunks(&mut self) -> Result<Vec<IndexedFile>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.id, f.file_path, f.mtime, f.file_type
+             FROM files f
+             LEFT JOIN chunks c ON c.file_id = f.id
+             WHERE c.id IS NULL",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(IndexedFile {
+                id: row.get(0)?,
+                file_path: row.get(1)?,
+                mtime: row.get(2)?,
+                file_type: row.get(3)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_orphaned_chunk_ids(&mut self) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id FROM chunks c
+             LEFT JOIN files f ON f.id = c.file_id
+             WHERE f.id IS NULL",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn delete_chunks_by_ids(&mut self, chunk_ids: &[i64]) -> Result<()> {
+        if chunk_ids.is_empty() {
+            return Ok(());
+        }
+        let batch_size = 500;
+        for chunk in chunk_ids.chunks(batch_size) {
+            let (placeholders, params) = in_clause_params(chunk);
+            let sql = format!("DELETE FROM chunks WHERE id IN ({})", placeholders);
+            self.conn.execute(&sql, params.as_slice())?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn inject_orphaned_chunk(&mut self) -> Result<()> {
+        self.conn.execute("PRAGMA foreign_keys=OFF", [])?;
+        self.conn.execute(
+            "INSERT INTO chunks (file_id, file_path, start_line, end_line, kind, content, file_type)
+             VALUES (99999, 'orphan.rs', 1, 1, 'file', 'orphan code', 'rust')",
+            [],
+        )?;
+        self.conn.execute("PRAGMA foreign_keys=ON", [])?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn index_file_transactional(
+        &mut self,
+        file_path: &str,
+        mtime: f64,
+        file_type: &str,
+        existing_file_id: Option<i64>,
+        chunks: &[super::text_chunker::TextChunk],
+        imports: &[String],
+    ) -> Result<(i64, Vec<i64>)> {
+        let tx = self.conn.transaction()?;
+
+        let file_id = match existing_file_id {
+            Some(id) => {
+                tx.execute(
+                    "UPDATE files SET mtime = ?1, file_type = ?2 WHERE id = ?3",
+                    params![mtime, file_type, id],
+                )?;
+                id
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO files (file_path, mtime, file_type) VALUES (?1, ?2, ?3)",
+                    params![file_path, mtime, file_type],
+                )?;
+                tx.last_insert_rowid()
+            }
+        };
+
+        tx.execute("DELETE FROM chunks WHERE file_id = ?1", params![file_id])?;
+        tx.execute(
+            "DELETE FROM imports WHERE source_file_id = ?1",
+            params![file_id],
+        )?;
+
+        let mut chunk_ids = Vec::with_capacity(chunks.len());
+        for text_chunk in chunks {
+            tx.execute(
+                "INSERT INTO chunks (file_id, file_path, start_line, end_line, kind, name, content, file_type)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    file_id,
+                    text_chunk.file_path,
+                    text_chunk.start_line as i64,
+                    text_chunk.end_line as i64,
+                    text_chunk.kind.to_string(),
+                    text_chunk.name,
+                    text_chunk.content,
+                    file_type,
+                ],
+            )?;
+            let chunk_id = tx.last_insert_rowid();
+            chunk_ids.push(chunk_id);
+
+            if let Some(ref name) = text_chunk.name {
+                tx.execute(
+                    "INSERT INTO symbols (chunk_id, name, kind) VALUES (?1, ?2, ?3)",
+                    params![chunk_id, name, text_chunk.kind.to_string()],
+                )?;
+            }
+        }
+
+        for target_path in imports {
+            tx.execute(
+                "INSERT OR IGNORE INTO imports (source_file_id, target_file_path) VALUES (?1, ?2)",
+                params![file_id, target_path],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok((file_id, chunk_ids))
     }
 }
 
@@ -688,5 +819,174 @@ mod tests {
 
         let embeddings = db.get_all_embeddings("model").expect("get");
         assert_eq!(embeddings.len(), 2);
+    }
+
+    #[test]
+    fn get_files_with_zero_chunks_returns_files_without_chunks() {
+        let mut db = test_db();
+        let id_with_chunks = db.upsert_file("with.rs", 1.0, "rust").expect("file");
+        db.insert_chunk(
+            id_with_chunks,
+            "with.rs",
+            1,
+            1,
+            "file",
+            None,
+            "code",
+            "rust",
+        )
+        .expect("chunk");
+
+        let _id_without = db.upsert_file("without.rs", 1.0, "rust").expect("file");
+
+        let zero_chunk_files = db.get_files_with_zero_chunks().expect("query");
+        assert_eq!(zero_chunk_files.len(), 1);
+        assert_eq!(zero_chunk_files[0].file_path, "without.rs");
+    }
+
+    #[test]
+    fn get_files_with_zero_chunks_empty_db_returns_empty() {
+        let mut db = test_db();
+        let result = db.get_files_with_zero_chunks().expect("query");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn get_orphaned_chunk_ids_detects_orphans() {
+        let mut db = test_db();
+        let file_id = db.upsert_file("real.rs", 1.0, "rust").expect("file");
+        db.insert_chunk(file_id, "real.rs", 1, 1, "file", None, "code", "rust")
+            .expect("chunk");
+
+        db.conn
+            .execute("PRAGMA foreign_keys=OFF", [])
+            .expect("disable FK");
+        db.conn
+            .execute(
+                "INSERT INTO chunks (file_id, file_path, start_line, end_line, kind, content, file_type)
+                 VALUES (99999, 'orphan.rs', 1, 1, 'file', 'code', 'rust')",
+                [],
+            )
+            .expect("insert orphan");
+        db.conn
+            .execute("PRAGMA foreign_keys=ON", [])
+            .expect("re-enable FK");
+
+        let orphans = db.get_orphaned_chunk_ids().expect("query");
+        assert_eq!(orphans.len(), 1);
+    }
+
+    #[test]
+    fn index_file_transactional_inserts_chunks_atomically() {
+        let mut db = test_db();
+        let chunks = vec![crate::text_chunker::TextChunk {
+            file_path: "test.rs".to_string(),
+            start_line: 1,
+            end_line: 3,
+            kind: crate::text_chunker::ChunkKind::Function,
+            name: Some("my_func".to_string()),
+            content: "fn my_func() {}".to_string(),
+        }];
+
+        let (file_id, chunk_ids) = db
+            .index_file_transactional("test.rs", 1.0, "rust", None, &chunks, &[])
+            .expect("transactional");
+
+        assert!(file_id > 0);
+        assert_eq!(chunk_ids.len(), 1);
+
+        let all_chunks = db.get_all_chunks().expect("chunks");
+        assert_eq!(all_chunks.len(), 1);
+        assert_eq!(all_chunks[0].name, Some("my_func".to_string()));
+
+        let symbols = db.get_all_symbols().expect("symbols");
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].1, "my_func");
+    }
+
+    #[test]
+    fn index_file_transactional_replaces_old_chunks() {
+        let mut db = test_db();
+        let old_chunks = vec![crate::text_chunker::TextChunk {
+            file_path: "test.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+            kind: crate::text_chunker::ChunkKind::Function,
+            name: Some("old".to_string()),
+            content: "fn old() {}".to_string(),
+        }];
+
+        let (file_id, old_ids) = db
+            .index_file_transactional("test.rs", 1.0, "rust", None, &old_chunks, &[])
+            .expect("first insert");
+        assert_eq!(old_ids.len(), 1);
+
+        let new_chunks = vec![crate::text_chunker::TextChunk {
+            file_path: "test.rs".to_string(),
+            start_line: 1,
+            end_line: 2,
+            kind: crate::text_chunker::ChunkKind::Function,
+            name: Some("new".to_string()),
+            content: "fn new() {}".to_string(),
+        }];
+
+        let (_, new_ids) = db
+            .index_file_transactional("test.rs", 2.0, "rust", Some(file_id), &new_chunks, &[])
+            .expect("second insert");
+        assert_eq!(new_ids.len(), 1);
+
+        let all_chunks = db.get_all_chunks().expect("chunks");
+        assert_eq!(all_chunks.len(), 1);
+        assert_eq!(all_chunks[0].name, Some("new".to_string()));
+
+        let symbols = db.get_all_symbols().expect("symbols");
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].1, "new");
+    }
+
+    #[test]
+    fn index_file_transactional_inserts_imports() {
+        let mut db = test_db();
+        let chunks = vec![crate::text_chunker::TextChunk {
+            file_path: "main.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+            kind: crate::text_chunker::ChunkKind::File,
+            name: None,
+            content: "fn main() {}".to_string(),
+        }];
+
+        let imports = vec!["lib.rs".to_string()];
+        let (file_id, _) = db
+            .index_file_transactional("main.rs", 1.0, "rust", None, &chunks, &imports)
+            .expect("insert");
+
+        let from_imports = db.get_imports_from(file_id).expect("imports");
+        assert_eq!(from_imports, vec!["lib.rs"]);
+    }
+
+    #[test]
+    fn delete_chunks_by_ids_removes_chunks() {
+        let mut db = test_db();
+        let file_id = db.upsert_file("test.rs", 1.0, "rust").expect("file");
+        let c1 = db
+            .insert_chunk(file_id, "test.rs", 1, 1, "file", None, "a", "rust")
+            .expect("chunk");
+        db.insert_chunk(file_id, "test.rs", 2, 2, "file", None, "b", "rust")
+            .expect("chunk");
+
+        db.delete_chunks_by_ids(&[c1]).expect("delete");
+
+        let chunks = db.get_all_chunks().expect("chunks");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].content, "b");
+    }
+
+    #[test]
+    fn delete_chunks_by_ids_empty_is_noop() {
+        let mut db = test_db();
+        db.delete_chunks_by_ids(&[]).expect("delete empty");
+        let chunks = db.get_all_chunks().expect("chunks");
+        assert!(chunks.is_empty());
     }
 }

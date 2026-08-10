@@ -50,8 +50,9 @@ The crate uses edition 2024. Default features enable `tree-sitter-rust`. Additio
 
 1. `SearchEngine::search()` opens/creates `.search-index/search.db` in the project root
 2. `scanner` walks the project, diffing against indexed files by mtime
-3. New/changed files are chunked, embedded, and stored in SQLite; orphaned embeddings (from interrupted indexing) are repaired
-4. Query is classified → six metric signals computed → POEM ranking → formatted output
+3. Index integrity is verified: zero-chunk files (corruption from interrupted indexing) are re-queued; orphaned chunks (file_id no longer exists) are deleted
+4. New/changed/corrupted files are chunked, embedded, and stored in SQLite via per-file transactions; orphaned embeddings (from interrupted indexing) are repaired
+5. Query is classified → six metric signals computed → POEM ranking → formatted output
 
 `SearchEngine::prepare()` eagerly resolves the ONNX model without building the index; `search()` remains lazy and hard-errors on embedder failure.
 
