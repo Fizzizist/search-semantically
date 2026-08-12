@@ -123,6 +123,43 @@ cargo test -- --nocapture          # run tests with stdout visible
 
 All tests use `tempfile::TempDir` for full isolation — no setup required.
 
+### ONNX Runtime Linking Strategies
+
+This crate offers two mutually exclusive linking strategies for the ONNX Runtime, controlled via Cargo features:
+
+#### `download-binaries` (default)
+
+ONNX Runtime is downloaded and linked at build time. This is the zero-configuration path — everything works out of the box, no environment setup required.
+
+- **Tradeoff**: requires network access during build; adds ~15–30 MB to build artifacts.
+- **No `ORT_DYLIB_PATH` needed** — the runtime is embedded in the binary.
+
+#### `load-dynamic` (opt-in)
+
+The ONNX Runtime is loaded at runtime via `dlopen` (or `LoadLibrary` on Windows). The consumer is responsible for sourcing `libonnxruntime` themselves — either via system package manager, manual install, or the `ORT_DYLIB_PATH` environment variable.
+
+- **Tradeoff**: smaller binary, no network access at build time; but requires the consumer to install ONNX Runtime on the target system.
+- **Preflight check**: at initialization, the embedder probes for `libonnxruntime` and provides a guiding error message if it's missing or incompatible.
+- The `libloading` crate is only included in the dependency tree under this feature.
+
+#### Selecting a Strategy
+
+Default (`download-binaries`):
+
+```toml
+[dependencies]
+search-semantically = "0.3"
+```
+
+Opt-in (`load-dynamic`):
+
+```toml
+[dependencies]
+search-semantically = { version = "0.3", default-features = false, features = ["ts-rust", "load-dynamic"] }
+```
+
+Enabling both features simultaneously produces a `compile_error!` at build time.
+
 ## Index Storage
 
 - **Index database**: `<project_root>/.search-index/search.db`

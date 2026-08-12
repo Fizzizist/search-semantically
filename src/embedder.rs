@@ -4,6 +4,11 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
+#[cfg(all(feature = "download-binaries", feature = "load-dynamic"))]
+compile_error!(
+    "'download-binaries' and 'load-dynamic' features are mutually exclusive; enable only one"
+);
+
 #[derive(Debug, Clone)]
 pub enum DownloadEvent {
     Started { url: String },
@@ -67,8 +72,11 @@ impl Embedder {
         let onnx_path = model_dir.join("model.onnx");
         let tokenizer_path = model_dir.join("tokenizer.json");
 
-        let dylib_path = resolve_onnx_runtime()?;
-        configure_onnx_runtime(&dylib_path);
+        #[cfg(feature = "load-dynamic")]
+        {
+            let dylib_path = resolve_onnx_runtime()?;
+            configure_onnx_runtime(&dylib_path);
+        }
 
         let session = Session::builder()
             .context("Creating ONNX session builder")?
@@ -173,6 +181,7 @@ pub(crate) fn cache_is_valid(model_dir: &Path) -> bool {
     model_ok && tokenizer_ok
 }
 
+#[cfg(feature = "load-dynamic")]
 fn onnx_runtime_dylib_name() -> &'static str {
     #[cfg(target_os = "windows")]
     {
@@ -198,8 +207,10 @@ fn onnx_runtime_dylib_name() -> &'static str {
     }
 }
 
+#[cfg(feature = "load-dynamic")]
 static ORT_DYLIB_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
+#[cfg(feature = "load-dynamic")]
 fn resolve_onnx_runtime() -> Result<PathBuf> {
     let dylib_name = onnx_runtime_dylib_name();
     let path = resolve_dylib_path(dylib_name);
@@ -227,6 +238,7 @@ fn resolve_onnx_runtime() -> Result<PathBuf> {
     Ok(path)
 }
 
+#[cfg(feature = "load-dynamic")]
 fn configure_onnx_runtime(dylib_path: &Path) {
     if !dylib_path.is_absolute() || !dylib_path.exists() {
         return;
@@ -245,6 +257,7 @@ fn configure_onnx_runtime(dylib_path: &Path) {
     });
 }
 
+#[cfg(feature = "load-dynamic")]
 fn resolve_dylib_path(dylib_name: &str) -> PathBuf {
     if let Ok(s) = std::env::var("ORT_DYLIB_PATH")
         && !s.is_empty()
@@ -272,6 +285,7 @@ fn resolve_dylib_path(dylib_name: &str) -> PathBuf {
     PathBuf::from(dylib_name)
 }
 
+#[cfg(feature = "load-dynamic")]
 #[cfg(unix)]
 fn resolve_via_ldconfig(dylib_name: &str) -> Option<PathBuf> {
     let output = std::process::Command::new("ldconfig")
@@ -583,6 +597,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "load-dynamic")]
     #[test]
     fn resolve_onnx_runtime_missing_dylib_returns_error() {
         let orig = std::env::var("ORT_DYLIB_PATH").ok();
@@ -613,6 +628,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "load-dynamic")]
     #[test]
     fn resolve_onnx_runtime_bad_dylib_path_returns_error() {
         let temp_dir = TempDir::new().expect("temp dir");
@@ -640,6 +656,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[cfg(feature = "load-dynamic")]
     #[test]
     fn configure_onnx_runtime_guards_against_relative_path() {
         let orig = std::env::var("ORT_DYLIB_PATH").ok();
