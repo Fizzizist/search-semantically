@@ -43,7 +43,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-search-semantically = "0.3"
+search-semantically = "0.4"
 ```
 
 Then use it:
@@ -148,14 +148,14 @@ Default (`download-binaries`):
 
 ```toml
 [dependencies]
-search-semantically = "0.3"
+search-semantically = "0.4"
 ```
 
 Opt-in (`load-dynamic`):
 
 ```toml
 [dependencies]
-search-semantically = { version = "0.3", default-features = false, features = ["ts-rust", "load-dynamic"] }
+search-semantically = { version = "0.4", default-features = false, features = ["ts-rust", "load-dynamic"] }
 ```
 
 Enabling both features simultaneously produces a `compile_error!` at build time.
