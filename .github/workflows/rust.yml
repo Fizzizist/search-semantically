@@ -11,9 +11,7 @@ env:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
-
     steps:
     - uses: actions/checkout@v4
     - name: Format
@@ -24,3 +22,14 @@ jobs:
       run: cargo build --verbose
     - name: Run tests
       run: cargo test --verbose
+
+  load-dynamic:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Run clippy (load-dynamic)
+      run: cargo clippy --no-default-features --features ts-rust,load-dynamic -- -D warnings
+    - name: Build (load-dynamic)
+      run: cargo build --no-default-features --features ts-rust,load-dynamic --verbose
+    - name: Run tests (load-dynamic)
+      run: cargo test --no-default-features --features ts-rust,load-dynamic --verbose
