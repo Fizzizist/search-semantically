@@ -79,8 +79,11 @@ The crate uses edition 2024. Default features enable `tree-sitter-rust`. Additio
 
 ## Dependencies of note
 
-- `ort` (ONNX Runtime) — dynamic loading via `load-dynamic` feature
-- `libloading` — pre-flight dylib verification before `ort` session creation
+- `ort` (ONNX Runtime) — dual linking strategy via crate features:
+  - `download-binaries` (default): static linking, ONNX Runtime downloaded at build time
+  - `load-dynamic` (opt-in): dynamic linking via `dlopen`, consumer sources `libonnxruntime` at runtime
+  - Both features are mutually exclusive; enabling both triggers a `compile_error!`
+- `libloading` — optional dependency, activated only by the `load-dynamic` feature for dlopen preflight
 - `rusqlite` — bundled SQLite
 - `tree-sitter` + per-language grammars (feature-gated)
 - `tokenizers` (HuggingFace) — for embedding tokenization
